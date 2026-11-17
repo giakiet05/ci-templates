@@ -1,0 +1,88 @@
+name: plan
+description: >-
+  Decide the run mode and which services to check, build and carry, from the caller's Compose
+  file and the paths changed by the triggering event. Requires a checkout with full history.
+
+inputs:
+  compose-file:
+    description: Repo-relative path of the deploy Compose file.
+    required: true
+
+outputs:
+  mode:
+    description: check | publish | release
+    value: ${{ steps.plan.outputs.mode }}
+  sha-tag:
+    description: Image tag for this commit, e.g. sha-a1b2c3d.
+    value: ${{ steps.plan.outputs.sha-tag }}
+  checks:
+    description: JSON list of {name, dir} to lint and test.
+    value: ${{ steps.plan.outputs.checks }}
+  build:
+    description: JSON list of {name, image, context, dockerfile, target, args} to build.
+    value: ${{ steps.plan.outputs.build }}
+  carry:
+    description: JSON list of {name, image} to retag from :dev (publish mode only).
+    value: ${{ steps.plan.outputs.carry }}
+  all:
+    description: JSON list of {name, image} for every image the repo owns.
+    value: ${{ steps.plan.outputs.all }}
+
+runs:
+  using: composite
+  steps:
+    - name: List changed paths
+      id: changed
+      shell: bash
+      env:
+        EVENT: ${{ github.event_name }}
+        PR_BASE: ${{ github.event.pull_request.base.sha }}
+        PUSH_BEFORE: ${{ github.event.before }}
+      run: |
+        set -euo pipefail
+        file="$RUNNER_TEMP/changed-paths.txt"
+        scope=all
+        case "$EVENT" in
+          pull_request)
+            git diff --name-only "$PR_BASE" "$GITHUB_SHA" > "$file"
+            scope=list
+            ;;
+          push)
+            # A new branch has no usable "before" commit; build everything in that case.
+            if [[ "$GITHUB_REF" == refs/heads/* && -n "$PUSH_BEFORE" && ! "$PUSH_BEFORE" =~ ^0+$ ]] \
+              && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+              git diff --name-only "$PUSH_BEFORE" "$GITHUB_SHA" > "$file"
+              scope=list
+            fi
+            ;;
+        esac
+        echo "scope=$scope" >> "$GITHUB_OUTPUT"
+        echo "file=$file" >> "$GITHUB_OUTPUT"
+
+    - name: Plan the run
+      id: plan
+      shell: bash
+      env:
+        COMPOSE_FILE: ${{ inputs.compose-file }}
+        EVENT: ${{ github.event_name }}
+        SCOPE: ${{ steps.changed.outputs.scope }}
+        CHANGED_FILE: ${{ steps.changed.outputs.file }}
+      run: |
+        set -euo pipefail
+        if [ ! -f "$COMPOSE_FILE" ]; then
+          echo "::error title=plan::compose file '$COMPOSE_FILE' not found"
+          exit 1
+        fi
+        # explode() resolves YAML anchors and merge keys; no ${VAR} interpolation happens here.
+        yq -o=json 'explode(.)' "$COMPOSE_FILE" > "$RUNNER_TEMP/compose.json"
+        args=(
+          --compose-json "$RUNNER_TEMP/compose.json"
+          --compose-file "$COMPOSE_FILE"
+          --event "$EVENT"
+          --ref "$GITHUB_REF"
+          --sha "$GITHUB_SHA"
+        )
+        if [ "$SCOPE" = list ]; then
+          args+=(--changed-files "$CHANGED_FILE")
+        fi
+        python3 "$GITHUB_ACTION_PATH/plan.py" "${args[@]}"

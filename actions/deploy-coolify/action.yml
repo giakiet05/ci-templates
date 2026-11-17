@@ -1,0 +1,35 @@
+name: deploy-coolify
+description: >-
+  Point a Coolify Docker Compose application at an image tag (its TAG environment variable),
+  trigger a deployment and wait until Coolify reports it finished or failed.
+
+inputs:
+  version:
+    description: Image tag to deploy, e.g. v0.3.0.
+    required: true
+  api-url:
+    description: Base URL of the Coolify instance, e.g. https://coolify.example.com.
+    required: true
+  token:
+    description: Coolify API token with deploy permission.
+    required: true
+  app-uuid:
+    description: UUID of the Coolify application.
+    required: true
+  timeout-seconds:
+    description: How long to wait for the deployment to finish.
+    required: false
+    default: "900"
+
+runs:
+  using: composite
+  steps:
+    - name: Deploy and wait
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        COOLIFY_API_URL: ${{ inputs.api-url }}
+        COOLIFY_TOKEN: ${{ inputs.token }}
+        APP_UUID: ${{ inputs.app-uuid }}
+        TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+      run: bash "$GITHUB_ACTION_PATH/deploy.sh"

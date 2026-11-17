@@ -1,0 +1,12 @@
+# Keeps the SHA-pinned actions current: Dependabot opens one grouped PR with the new SHAs.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /actions/*
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

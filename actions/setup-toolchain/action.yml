@@ -1,0 +1,79 @@
+name: setup-toolchain
+description: >-
+  Install the language toolchain a directory needs, detected from its files (go.mod,
+  pyproject.toml, package.json), then run the directory's optional `make ci-setup` hook.
+  Tools already on GitHub's Ubuntu runners (make, gcc, clang, cargo) need no setup.
+
+inputs:
+  dir:
+    description: Repo-relative directory holding the Makefile.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Detect toolchains
+      id: detect
+      shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+      run: |
+        set -euo pipefail
+        flag() { if [ -f "$DIR/$1" ]; then echo true; else echo false; fi; }
+        {
+          echo "go=$(flag go.mod)"
+          echo "python=$(flag pyproject.toml)"
+          echo "node=$(flag package.json)"
+          # setup-node reads .nvmrc when present, otherwise installs the current LTS.
+          if [ -f "$DIR/.nvmrc" ]; then
+            echo "node-version="
+            echo "node-version-file=$DIR/.nvmrc"
+          else
+            echo "node-version=lts/*"
+            echo "node-version-file="
+          fi
+          # npm caching needs a lockfile; without one, caching is skipped instead of failing.
+          if [ -f "$DIR/package-lock.json" ]; then
+            echo "npm-cache=npm"
+            echo "npm-lock=$DIR/package-lock.json"
+          else
+            echo "npm-cache="
+            echo "npm-lock="
+          fi
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Set up Go
+      if: steps.detect.outputs.go == 'true'
+      uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+      with:
+        go-version-file: ${{ inputs.dir }}/go.mod
+        cache-dependency-path: ${{ inputs.dir }}/go.sum
+
+    - name: Set up uv
+      if: steps.detect.outputs.python == 'true'
+      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        working-directory: ${{ inputs.dir }}
+        enable-cache: true
+        cache-dependency-glob: "**/uv.lock"
+
+    - name: Set up Node
+      if: steps.detect.outputs.node == 'true'
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: ${{ steps.detect.outputs.node-version }}
+        node-version-file: ${{ steps.detect.outputs.node-version-file }}
+        cache: ${{ steps.detect.outputs.npm-cache }}
+        cache-dependency-path: ${{ steps.detect.outputs.npm-lock }}
+
+    - name: Run the repo's ci-setup hook
+      shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+      run: |
+        set -euo pipefail
+        if make -C "$DIR" -n ci-setup >/dev/null 2>&1; then
+          make -C "$DIR" ci-setup
+        else
+          echo "no ci-setup target in $DIR"
+        fi

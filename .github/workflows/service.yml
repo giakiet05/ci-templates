@@ -1,0 +1,282 @@
+# Reusable pipeline for container services. See README.md for the repo contract.
+#
+#   pull_request    -> check:   quality + build (no push) for changed services
+#   push to branch  -> publish: quality + build + push :sha-<short>, scan, move :dev, carry the rest
+#   push tag v*     -> release: promote :sha-<short> to the tag, deploy, GitHub Release
+name: service
+
+on:
+  workflow_call:
+    inputs:
+      compose-file:
+        description: Repo-relative path of the deploy Compose file.
+        type: string
+        default: compose.yaml
+      deploy:
+        description: Deploy target for releases (coolify | none).
+        type: string
+        default: none
+      runs-on:
+        description: Runner label for the deploy job (a self-hosted label when the target is LAN-only).
+        type: string
+        default: ubuntu-latest
+    secrets:
+      COOLIFY_API_URL:
+        required: false
+      COOLIFY_TOKEN:
+        required: false
+      COOLIFY_APP_UUID:
+        required: false
+
+jobs:
+  resolve:
+    name: resolve
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      sha-tag: ${{ steps.plan.outputs.sha-tag }}
+      checks: ${{ steps.plan.outputs.checks }}
+      build: ${{ steps.plan.outputs.build }}
+      carry: ${{ steps.plan.outputs.carry }}
+      all: ${{ steps.plan.outputs.all }}
+    steps:
+      - name: Validate inputs
+        env:
+          DEPLOY: ${{ inputs.deploy }}
+        run: |
+          case "$DEPLOY" in
+            coolify | none) ;;
+            *) echo "::error title=inputs::deploy must be 'coolify' or 'none', got '$DEPLOY'"; exit 1 ;;
+          esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        uses: giakiet05/ci-templates/actions/plan@main
+        with:
+          compose-file: ${{ inputs.compose-file }}
+
+  quality:
+    name: quality (${{ matrix.target.name }})
+    needs: resolve
+    if: needs.resolve.outputs.mode != 'release' && needs.resolve.outputs.checks != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.resolve.outputs.checks) }}
+    env:
+      DIR: ${{ matrix.target.dir }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the Makefile contract
+        run: |
+          for target in lint test; do
+            if ! make -C "$DIR" -n "$target" >/dev/null 2>&1; then
+              echo "::error title=contract::$DIR/Makefile must define a '$target' target"
+              exit 1
+            fi
+          done
+      - uses: giakiet05/ci-templates/actions/setup-toolchain@main
+        with:
+          dir: ${{ matrix.target.dir }}
+      - name: Lint
+        run: make -C "$DIR" lint
+      - name: Test
+        run: make -C "$DIR" test
+      - name: Integration tests
+        run: |
+          if make -C "$DIR" -n test-integration >/dev/null 2>&1; then
+            make -C "$DIR" test-integration
+          else
+            echo "no test-integration target in $DIR"
+          fi
+
+  build:
+    name: build (${{ matrix.svc.name }})
+    needs: [resolve, quality]
+    if: needs.resolve.outputs.mode != 'release' && needs.resolve.outputs.build != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        svc: ${{ fromJSON(needs.resolve.outputs.build) }}
+    env:
+      PUBLISH: ${{ needs.resolve.outputs.mode == 'publish' }}
+      IMAGE: ${{ matrix.svc.image }}
+      SHA_TAG: ${{ needs.resolve.outputs.sha-tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build${{ env.PUBLISH == 'true' && ' and push' || '' }}
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.svc.context }}
+          file: ${{ matrix.svc.dockerfile }}
+          target: ${{ matrix.svc.target }}
+          build-args: ${{ matrix.svc.args }}
+          push: ${{ env.PUBLISH == 'true' }}
+          tags: ${{ matrix.svc.image }}:${{ needs.resolve.outputs.sha-tag }}
+          cache-from: type=gha,scope=${{ matrix.svc.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.svc.name }}
+      - name: Scan for critical vulnerabilities
+        if: env.PUBLISH == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ github.token }}
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ env.SHA_TAG }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      # :dev moves only after the scan passes, so carry never copies a rejected image.
+      - name: Move the dev tag
+        if: env.PUBLISH == 'true'
+        run: docker buildx imagetools create --tag "$IMAGE:dev" "$IMAGE:$SHA_TAG"
+
+  carry:
+    name: carry
+    needs: [resolve, build]
+    # Runs when nothing was built too (build skipped), so every commit gets a full image set.
+    if: >-
+      always()
+      && needs.resolve.result == 'success'
+      && needs.resolve.outputs.mode == 'publish'
+      && needs.resolve.outputs.carry != '[]'
+      && contains(fromJSON('["success","skipped"]'), needs.build.result)
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    env:
+      CARRY: ${{ needs.resolve.outputs.carry }}
+      SHA_TAG: ${{ needs.resolve.outputs.sha-tag }}
+    steps:
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Retag unchanged images to this commit
+        run: |
+          set -euo pipefail
+          for image in $(jq -r '.[].image' <<<"$CARRY"); do
+            if ! docker buildx imagetools create --tag "$image:$SHA_TAG" "$image:dev"; then
+              echo "::error title=carry::$image:dev does not exist yet; run this workflow manually (workflow_dispatch) to build everything"
+              exit 1
+            fi
+            echo "carried $image:dev -> $image:$SHA_TAG"
+          done
+
+  preflight:
+    name: preflight
+    needs: resolve
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    env:
+      ALL: ${{ needs.resolve.outputs.all }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Check every image exists for the release candidate
+        run: |
+          set -euo pipefail
+          tag="sha-${HEAD_SHA:0:7}"
+          missing=0
+          for image in $(jq -r '.[].image' <<<"$ALL"); do
+            if docker buildx imagetools inspect "$image:$tag" >/dev/null 2>&1; then
+              echo "found $image:$tag"
+            else
+              echo "::error title=preflight::$image:$tag is missing; merge the change into dev first"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+  promote:
+    name: promote
+    needs: resolve
+    if: needs.resolve.outputs.mode == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    env:
+      ALL: ${{ needs.resolve.outputs.all }}
+      SHA_TAG: ${{ needs.resolve.outputs.sha-tag }}
+    steps:
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Promote the commit's images to the release tag
+        run: |
+          set -euo pipefail
+          images=$(jq -r '.[].image' <<<"$ALL")
+          # Verify the whole set first so a release is all-or-nothing.
+          for image in $images; do
+            if ! docker buildx imagetools inspect "$image:$SHA_TAG" >/dev/null 2>&1; then
+              echo "::error title=promote::$image:$SHA_TAG is missing; tag a commit that passed the dev pipeline"
+              exit 1
+            fi
+          done
+          for image in $images; do
+            docker buildx imagetools create --tag "$image:$GITHUB_REF_NAME" "$image:$SHA_TAG"
+            echo "promoted $image:$SHA_TAG -> $image:$GITHUB_REF_NAME"
+          done
+
+  deploy:
+    name: deploy (${{ inputs.deploy }})
+    needs: promote
+    if: inputs.deploy == 'coolify'
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    steps:
+      - uses: giakiet05/ci-templates/actions/deploy-coolify@main
+        with:
+          version: ${{ github.ref_name }}
+          api-url: ${{ secrets.COOLIFY_API_URL }}
+          token: ${{ secrets.COOLIFY_TOKEN }}
+          app-uuid: ${{ secrets.COOLIFY_APP_UUID }}
+
+  release:
+    name: release
+    needs: [promote, deploy]
+    if: >-
+      always()
+      && needs.promote.result == 'success'
+      && contains(fromJSON('["success","skipped"]'), needs.deploy.result)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes --verify-tag
