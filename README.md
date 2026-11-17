@@ -78,7 +78,7 @@ services:
 | Tag `v*` | release | **promote** `:sha-<short>` to `:vX.Y.Z`, **deploy**, GitHub Release |
 
 **Changed services** are those whose folder or `watch` globs match the diff. A change to the
-Compose file or to `.github/` counts as a change to everything.
+Compose file, to `.github/` or to `.trivyignore.yaml` counts as a change to everything.
 
 **Carry**: services that did not change are retagged from `:dev` to `:sha-<this commit>` (a
 manifest copy, no rebuild), so every commit on `dev` has a complete image set and can be released.

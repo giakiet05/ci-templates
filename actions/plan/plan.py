@@ -18,8 +18,9 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
-# Changes under these paths can alter every job, so they rebuild everything.
-GLOBAL_TRIGGERS: tuple[str, ...] = (".github/**",)
+# Changes under these paths can alter every job, so they rebuild everything. The scan's accepted
+# findings apply to every image, so editing them rescans all of them.
+GLOBAL_TRIGGERS: tuple[str, ...] = (".github/**", ".trivyignore.yaml")
 SHORT_SHA_LENGTH = 7
 
 

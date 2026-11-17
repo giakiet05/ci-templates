@@ -199,6 +199,10 @@ class BuildPlanTest(unittest.TestCase):
         result = plan.build_plan(monorepo(), "deploy/compose.yaml", "check", SHA, [".github/workflows/ci.yml"])
         self.assertEqual(self.names(result, "build"), ["server", "processor"])
 
+    def test_scan_ignore_change_rebuilds_everything(self) -> None:
+        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, [".trivyignore.yaml"])
+        self.assertEqual(self.names(result, "build"), ["server", "processor"])
+
     def test_unrelated_change_builds_nothing_and_carries_all(self) -> None:
         result = plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, ["docs/readme.md"])
         self.assertEqual(result["build"], [])
