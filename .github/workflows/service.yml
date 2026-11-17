@@ -149,6 +149,9 @@ jobs:
           severity: CRITICAL
           ignore-unfixed: true
           exit-code: "1"
+          # Accepted findings (with reason and expiry) live in the caller's .trivyignore.yaml; the action fails on a
+          # missing file, so it is passed only when the repository has one.
+          trivyignores: ${{ hashFiles('.trivyignore.yaml') != '' && '.trivyignore.yaml' || '' }}
       # :dev moves only after the scan passes, so carry never copies a rejected image.
       - name: Move the dev tag
         if: env.PUBLISH == 'true'

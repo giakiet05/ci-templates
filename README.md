@@ -83,6 +83,19 @@ Compose file or to `.github/` counts as a change to everything.
 **Carry**: services that did not change are retagged from `:dev` to `:sha-<this commit>` (a
 manifest copy, no rebuild), so every commit on `dev` has a complete image set and can be released.
 
+**Accepting a scan finding**: when a critical CVE cannot be fixed yet (for example a JAR bundled
+by a dependency with no patched release), list it in `.trivyignore.yaml` at the repository root
+with the package, a statement of why it is not exploitable, and an `expired_at` date. The scan
+picks the file up automatically and fails again once the date passes.
+
+```yaml
+vulnerabilities:
+  - id: CVE-2022-46337
+    purls: ["pkg:maven/org.apache.derby/derby@10.16.1.1"]
+    statement: Bundled by pyspark; the Hive metastore that would run Derby is never enabled.
+    expired_at: 2027-02-17
+```
+
 ## Secrets
 
 | Secret | When | What |
