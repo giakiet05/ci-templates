@@ -30,7 +30,7 @@ on:
 
 jobs:
   resolve:
-    name: resolve
+    name: plan run
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -50,17 +50,19 @@ jobs:
             coolify | none) ;;
             *) echo "::error title=inputs::deploy must be 'coolify' or 'none', got '$DEPLOY'"; exit 1 ;;
           esac
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out code with full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - id: plan
+      - name: Plan checks, builds and carries
+        id: plan
         uses: giakiet05/ci-templates/actions/plan@main
         with:
           compose-file: ${{ inputs.compose-file }}
 
   quality:
-    name: quality (${{ matrix.target.name }})
+    name: lint and test (${{ matrix.target.name }})
     needs: resolve
     if: needs.resolve.outputs.mode != 'release' && needs.resolve.outputs.checks != '[]'
     runs-on: ubuntu-latest
@@ -73,7 +75,8 @@ jobs:
     env:
       DIR: ${{ matrix.target.dir }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Check the Makefile contract
@@ -84,7 +87,8 @@ jobs:
               exit 1
             fi
           done
-      - uses: giakiet05/ci-templates/actions/setup-toolchain@main
+      - name: Set up language toolchain
+        uses: giakiet05/ci-templates/actions/setup-toolchain@main
         with:
           dir: ${{ matrix.target.dir }}
       - name: Lint
@@ -100,7 +104,7 @@ jobs:
           fi
 
   build:
-    name: build (${{ matrix.svc.name }})
+    name: build image (${{ matrix.svc.name }})
     needs: [resolve, quality]
     if: needs.resolve.outputs.mode != 'release' && needs.resolve.outputs.build != '[]'
     runs-on: ubuntu-latest
@@ -116,10 +120,12 @@ jobs:
       IMAGE: ${{ matrix.svc.image }}
       SHA_TAG: ${{ needs.resolve.outputs.sha-tag }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Log in to GHCR
         if: env.PUBLISH == 'true'
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
@@ -158,7 +164,7 @@ jobs:
         run: docker buildx imagetools create --tag "$IMAGE:dev" "$IMAGE:$SHA_TAG"
 
   carry:
-    name: carry
+    name: retag unchanged images
     needs: [resolve, build]
     # Runs when nothing was built too (build skipped), so every commit gets a full image set.
     if: >-
@@ -174,7 +180,8 @@ jobs:
       CARRY: ${{ needs.resolve.outputs.carry }}
       SHA_TAG: ${{ needs.resolve.outputs.sha-tag }}
     steps:
-      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -191,7 +198,7 @@ jobs:
           done
 
   preflight:
-    name: preflight
+    name: check release images exist
     needs: resolve
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
@@ -201,7 +208,8 @@ jobs:
       ALL: ${{ needs.resolve.outputs.all }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
-      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -222,7 +230,7 @@ jobs:
           exit "$missing"
 
   promote:
-    name: promote
+    name: promote images to release
     needs: resolve
     if: needs.resolve.outputs.mode == 'release'
     runs-on: ubuntu-latest
@@ -232,7 +240,8 @@ jobs:
       ALL: ${{ needs.resolve.outputs.all }}
       SHA_TAG: ${{ needs.resolve.outputs.sha-tag }}
     steps:
-      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -254,14 +263,16 @@ jobs:
           done
 
   deploy:
-    name: deploy (${{ inputs.deploy }})
+    # A static name: GitHub leaves expressions unexpanded in the names of skipped jobs.
+    name: deploy release
     needs: promote
     if: inputs.deploy == 'coolify'
     runs-on: ${{ inputs.runs-on }}
     permissions:
       contents: read
     steps:
-      - uses: giakiet05/ci-templates/actions/deploy-coolify@main
+      - name: Deploy to Coolify and wait for the result
+        uses: giakiet05/ci-templates/actions/deploy-coolify@main
         with:
           version: ${{ github.ref_name }}
           api-url: ${{ secrets.COOLIFY_API_URL }}
@@ -269,7 +280,7 @@ jobs:
           app-uuid: ${{ secrets.COOLIFY_APP_UUID }}
 
   release:
-    name: release
+    name: create GitHub release
     needs: [promote, deploy]
     if: >-
       always()

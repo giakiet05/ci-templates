@@ -69,13 +69,16 @@ services:
 
 ## What runs when
 
-| Event | Mode | Jobs |
+| Event | Mode | Jobs (as named in the Actions UI) |
 |---|---|---|
-| PR into `dev` | check | resolve, quality, build (no push) for changed services |
-| PR into `main` | check | the same, plus **preflight**: every image `:sha-<head>` must exist |
-| Push to `dev` | publish | quality, build + push `:sha-<short>`, Trivy scan (critical, fixable), move `:dev`, **carry** the rest |
+| PR into `dev` | check | plan run, lint and test, build image (no push) for changed services |
+| PR into `main` | check | the same, plus **check release images exist** (preflight): every image `:sha-<head>` must exist |
+| Push to `dev` | publish | lint and test, build image + push `:sha-<short>`, Trivy scan (critical, fixable), move `:dev`, **retag unchanged images** (carry) |
 | Manual run | publish | the same, treating every path as changed |
-| Tag `v*` | release | **promote** `:sha-<short>` to `:vX.Y.Z`, **deploy**, GitHub Release |
+| Tag `v*` | release | **promote images to release** (`:sha-<short>` to `:vX.Y.Z`), **deploy release**, **create GitHub release** |
+
+Job IDs in `service.yml` stay short (`resolve`, `quality`, `build`, `carry`, `preflight`, `promote`,
+`deploy`, `release`); they are what `needs:` refers to.
 
 **Changed services** are those whose folder or `watch` globs match the diff. A change to the
 Compose file, to `.github/` or to `.trivyignore.yaml` counts as a change to everything.
