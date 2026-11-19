@@ -7,6 +7,12 @@ inputs:
   compose-file:
     description: Repo-relative path of the deploy Compose file.
     required: true
+  build-compose-file:
+    description: >-
+      Optional repo-relative path of a build overlay (e.g. compose.override.yaml) holding the
+      services' build sections and x-ci, merged onto the deploy file. Empty for a single file.
+    required: false
+    default: ""
 
 outputs:
   mode:
@@ -64,16 +70,21 @@ runs:
       shell: bash
       env:
         COMPOSE_FILE: ${{ inputs.compose-file }}
+        BUILD_COMPOSE_FILE: ${{ inputs.build-compose-file }}
+        OWNER: ${{ github.repository_owner }}
         EVENT: ${{ github.event_name }}
         SCOPE: ${{ steps.changed.outputs.scope }}
         CHANGED_FILE: ${{ steps.changed.outputs.file }}
       run: |
         set -euo pipefail
-        if [ ! -f "$COMPOSE_FILE" ]; then
-          echo "::error title=plan::compose file '$COMPOSE_FILE' not found"
-          exit 1
-        fi
+        for file in "$COMPOSE_FILE" ${BUILD_COMPOSE_FILE:+"$BUILD_COMPOSE_FILE"}; do
+          if [ ! -f "$file" ]; then
+            echo "::error title=plan::compose file '$file' not found"
+            exit 1
+          fi
+        done
         # explode() resolves YAML anchors and merge keys; no ${VAR} interpolation happens here.
+        # Each file is converted on its own because anchors do not cross files; plan.py merges them.
         yq -o=json 'explode(.)' "$COMPOSE_FILE" > "$RUNNER_TEMP/compose.json"
         args=(
           --compose-json "$RUNNER_TEMP/compose.json"
@@ -82,6 +93,14 @@ runs:
           --ref "$GITHUB_REF"
           --sha "$GITHUB_SHA"
         )
+        if [ -n "$BUILD_COMPOSE_FILE" ]; then
+          yq -o=json 'explode(.)' "$BUILD_COMPOSE_FILE" > "$RUNNER_TEMP/compose-build.json"
+          args+=(
+            --build-compose-json "$RUNNER_TEMP/compose-build.json"
+            --build-compose-file "$BUILD_COMPOSE_FILE"
+            --owned-registry "ghcr.io/${OWNER,,}/"
+          )
+        fi
         if [ "$SCOPE" = list ]; then
           args+=(--changed-files "$CHANGED_FILE")
         fi

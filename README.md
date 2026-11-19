@@ -41,31 +41,46 @@ jobs:
 | # | The repo provides | Notes |
 |---|---|---|
 | 1 | A **deploy Compose file** (`compose-file` input, default `compose.yaml`) with **app services only** | Infrastructure (Postgres, Kafka...) belongs in `compose.dev.yaml` for local use. Coolify runs every service in the deploy file |
-| 2 | Every service with `build:` also has `image: ghcr.io/<owner>/<name>:${TAG:-dev}` | Lowercase. CI pushes to that repository with its own tags; Coolify pulls it with `TAG=vX.Y.Z`. Services may share an image (e.g. a bootstrap job) only with identical `build:` sections; it is built once |
-| 3 | A **Makefile next to each service's Dockerfile** with `lint` and `test` | Optional: `test-integration` (run after `test`), `ci-setup` (installs extra tools before anything else) |
-| 4 | Optional `x-ci` on a service | `watch`: extra repo-root globs that should rebuild it (shared code outside its folder). `path`: Makefile directory when it is not the Dockerfile's folder |
-| 5 | Optional top-level `x-ci.checks` | Directories that are linted and tested but have no image (shared libraries) |
-| 6 | Branch flow: PRs into `dev`; `dev` into `main` **fast-forward only**; releases are `v*` tags on `main` | Promotion finds images by commit SHA, so a merge commit on `main` would have no images |
+| 2 | Every service CI builds has `image: ghcr.io/<owner>/<name>:${TAG:-dev}` | Lowercase. CI pushes to that repository with its own tags; the platform pulls it with `TAG=vX.Y.Z`. Services may share an image (e.g. a bootstrap job) only with identical `build:` sections; it is built once |
+| 3 | The `build:` sections: in the deploy file, or in a **build overlay** (`build-compose-file` input, e.g. `compose.override.yaml`) | **Required for Coolify**: a deploy file with `build:` makes Coolify build the images on the server instead of pulling the ones CI tested and scanned. With an overlay, every service whose image is under `ghcr.io/<owner>/` must get a `build:` from it, unless marked `x-ci: {external: true}` |
+| 4 | A **Makefile next to each service's Dockerfile** with `lint` and `test` | Optional: `test-integration` (run after `test`), `ci-setup` (installs extra tools before anything else) |
+| 5 | Optional `x-ci` on a service | `watch`: extra repo-root globs that should rebuild it (shared code outside its folder). `path`: Makefile directory when it is not the Dockerfile's folder |
+| 6 | Optional top-level `x-ci.checks` | Directories that are linted and tested but have no image (shared libraries) |
+| 7 | Branch flow: PRs into `dev`; `dev` into `main` **fast-forward only**; releases are `v*` tags on `main` | Promotion finds images by commit SHA, so a merge commit on `main` would have no images |
 
-Paths in `build:` follow Compose rules (relative to the Compose file). Paths in `x-ci` are relative
-to the repo root. `${VAR}` values are never interpolated by CI, so `${VAR:?message}` is fine.
+Paths in `build:` follow Compose rules: relative to the deploy Compose file's directory, in the
+overlay too (Compose resolves every file from the first one). Paths in `x-ci` are relative to the
+repo root. `x-ci` may live in either file. `${VAR}` values are never interpolated by CI, so `${VAR:?message}` is fine.
 Not supported: `dockerfile_inline`, build contexts outside the repository.
 
-Example monorepo service:
+Example monorepo service, split for Coolify:
 
 ```yaml
+# compose.yaml: what runs (Coolify reads only this file)
+services:
+  api:
+    image: ghcr.io/owner/shop-api:${TAG:-dev}
+    restart: unless-stopped
+```
+
+```yaml
+# compose.override.yaml: how to build (CI, and `docker compose up --build` locally)
 x-ci:
   checks: [libs/shared]
 
 services:
   api:
-    image: ghcr.io/owner/shop-api:${TAG:-dev}
     build:
       context: .
       dockerfile: services/api/Dockerfile
     x-ci:
       watch: ["libs/shared/**"]
 ```
+
+Pass `build-compose-file: compose.override.yaml` in the caller's `with:` block. `docker compose`
+merges `compose.override.yaml` automatically when no `-f` is given, so local commands stay the same,
+while Coolify runs `docker compose -f compose.yaml` and never sees a `build:` section. A repo that
+does not deploy to Coolify may keep everything in one file.
 
 ## What runs when
 
@@ -81,7 +96,7 @@ Job IDs in `service.yml` stay short (`resolve`, `quality`, `build`, `carry`, `pr
 `deploy`, `release`); they are what `needs:` refers to.
 
 **Changed services** are those whose folder or `watch` globs match the diff. A change to the
-Compose file, to `.github/` or to `.trivyignore.yaml` counts as a change to everything.
+Compose file, the build overlay, `.github/` or `.trivyignore.yaml` counts as a change to everything.
 
 **Carry**: services that did not change are retagged from `:dev` to `:sha-<this commit>` (a
 manifest copy, no rebuild), so every commit on `dev` has a complete image set and can be released.
@@ -134,6 +149,7 @@ All third-party actions are pinned to full commit SHAs; Dependabot proposes upda
 major tag (`@v1`), commit, tag `v1.x.y`, and move `v1` to it. The internal references have to name
 a ref explicitly because GitHub cannot resolve "the same ref as this workflow" for actions.
 
-**Unverified so far:** the pipeline has not run against a real consumer yet, and the Coolify API
-calls (`PATCH /applications/{uuid}/envs`, `GET /deploy`, `GET /deployments/{uuid}`) have not been
-checked against a live Coolify instance.
+**Verified:** Coolify (4.7) builds every service that has `build:` in the deploy file, injecting its
+own `ARG` lines into the Dockerfiles; hence the build overlay. **Unverified so far:** the Coolify
+API calls (`PATCH /applications/{uuid}/envs`, `GET /deploy`, `GET /deployments/{uuid}`) have not
+been checked against a live Coolify instance.

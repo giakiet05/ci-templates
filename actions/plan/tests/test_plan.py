@@ -230,6 +230,94 @@ class BuildPlanTest(unittest.TestCase):
             plan.build_plan(monorepo(), "deploy/compose.yaml", "check", "abc", None)
 
 
+def deploy_file() -> dict:
+    """A deploy Compose file without build sections (what the platform runs)."""
+    return {
+        "services": {
+            "api": {"image": "ghcr.io/owner/app-api:${TAG:-dev}", "restart": "unless-stopped"},
+            "worker": {"image": "ghcr.io/owner/app-worker:${TAG:-dev}", "environment": {"X": "1"}},
+            "db": {"image": "postgres:17"},
+        },
+    }
+
+
+def build_overlay() -> dict:
+    """The matching build overlay (compose.override.yaml)."""
+    return {
+        "x-ci": {"checks": ["libs/shared"]},
+        "services": {
+            "api": {
+                "build": {"context": ".", "dockerfile": "services/api/Dockerfile"},
+                "x-ci": {"watch": ["libs/shared/**"]},
+            },
+            "worker": {"build": {"context": "services/worker"}},
+        },
+    }
+
+
+class BuildOverlayTest(unittest.TestCase):
+    """A deploy file plus a build overlay behaves like one combined file."""
+
+    def plan_with_overlay(self, overlay: dict, changed: list[str] | None = None, mode: str = "publish") -> dict:
+        return plan.build_plan(
+            deploy_file(),
+            "compose.yaml",
+            mode,
+            SHA,
+            changed,
+            build_overlay=overlay,
+            build_compose_file="compose.override.yaml",
+            owned_registry="ghcr.io/owner/",
+        )
+
+    def test_overlay_supplies_build_and_x_ci(self) -> None:
+        result = self.plan_with_overlay(build_overlay())
+        builds = {item["name"]: item for item in result["build"]}
+        self.assertEqual(builds["api"]["dockerfile"], "services/api/Dockerfile")
+        self.assertEqual(builds["worker"]["dockerfile"], "services/worker/Dockerfile")
+        self.assertIn("libs/shared", [item["name"] for item in result["checks"]])
+
+    def test_overlay_watch_applies(self) -> None:
+        result = self.plan_with_overlay(build_overlay(), changed=["libs/shared/greeting.go"])
+        self.assertEqual([item["name"] for item in result["build"]], ["api"])
+        self.assertEqual([item["name"] for item in result["carry"]], ["worker"])
+
+    def test_overlay_change_rebuilds_everything(self) -> None:
+        result = self.plan_with_overlay(build_overlay(), changed=["compose.override.yaml"])
+        self.assertEqual({item["name"] for item in result["build"]}, {"api", "worker"})
+
+    def test_owned_image_without_build_is_rejected(self) -> None:
+        overlay = build_overlay()
+        del overlay["services"]["worker"]
+        with self.assertRaisesRegex(plan.PlanError, "worker"):
+            self.plan_with_overlay(overlay)
+
+    def test_external_service_is_exempt(self) -> None:
+        overlay = build_overlay()
+        overlay["services"]["worker"] = {"x-ci": {"external": True}}
+        result = self.plan_with_overlay(overlay)
+        self.assertEqual([item["name"] for item in result["all"]], ["api"])
+
+    def test_owned_registry_match_ignores_case(self) -> None:
+        overlay = build_overlay()
+        del overlay["services"]["worker"]
+        with self.assertRaises(plan.PlanError):
+            plan.build_plan(deploy_file(), "compose.yaml", "publish", SHA, None,
+                            build_overlay=overlay, build_compose_file="compose.override.yaml",
+                            owned_registry="GHCR.IO/Owner/")
+
+    def test_merge_keeps_base_keys_and_inputs_untouched(self) -> None:
+        base, overlay = deploy_file(), build_overlay()
+        merged = plan.merge_compose(base, overlay)
+        self.assertEqual(merged["services"]["api"]["restart"], "unless-stopped")
+        self.assertIn("build", merged["services"]["api"])
+        self.assertNotIn("build", base["services"]["api"])
+
+    def test_overlay_scalars_and_lists_replace_base(self) -> None:
+        merged = plan.merge_compose({"a": {"b": [1, 2], "c": "x"}}, {"a": {"b": [3], "c": "y"}})
+        self.assertEqual(merged, {"a": {"b": [3], "c": "y"}})
+
+
 class MainTest(unittest.TestCase):
     """CLI behaviour, including the $GITHUB_OUTPUT format."""
 
@@ -274,6 +362,29 @@ class MainTest(unittest.TestCase):
         self.assertEqual(out["sha-tag"], "sha-a1b2c3d")
         self.assertEqual([item["name"] for item in json.loads(out["build"])], ["server"])
         self.assertEqual([item["name"] for item in json.loads(out["carry"])], ["processor"])
+
+    def test_build_overlay_flags(self) -> None:
+        self.compose_json.write_text(json.dumps(deploy_file()), encoding="utf-8")
+        overlay_json = self.dir / "compose-build.json"
+        overlay_json.write_text(json.dumps(build_overlay()), encoding="utf-8")
+        argv = [
+            "--compose-json", str(self.compose_json),
+            "--compose-file", "compose.yaml",
+            "--event", "push",
+            "--ref", "refs/heads/dev",
+            "--sha", SHA,
+            "--build-compose-json", str(overlay_json),
+            "--build-compose-file", "compose.override.yaml",
+            "--owned-registry", "ghcr.io/owner/",
+        ]
+        os.environ["GITHUB_OUTPUT"] = str(self.output)
+        self.addCleanup(os.environ.pop, "GITHUB_OUTPUT", None)
+        self.assertEqual(plan.main(argv), 0)
+        self.assertEqual({item["name"] for item in json.loads(self.outputs()["build"])}, {"api", "worker"})
+
+    def test_overlay_flags_must_come_together(self) -> None:
+        with self.assertRaises(SystemExit):
+            self.run_main("--build-compose-file", "compose.override.yaml")
 
     def test_contract_error_returns_one(self) -> None:
         self.compose_json.write_text(json.dumps({"services": {}}), encoding="utf-8")

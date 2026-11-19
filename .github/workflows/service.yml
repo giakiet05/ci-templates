@@ -12,6 +12,12 @@ on:
         description: Repo-relative path of the deploy Compose file.
         type: string
         default: compose.yaml
+      build-compose-file:
+        description: >-
+          Optional repo-relative path of the build overlay (e.g. compose.override.yaml) with the
+          services' build sections and x-ci. Use it when the deploy platform must only pull images.
+        type: string
+        default: ""
       deploy:
         description: Deploy target for releases (coolify | none).
         type: string
@@ -60,6 +66,7 @@ jobs:
         uses: giakiet05/ci-templates/actions/plan@main
         with:
           compose-file: ${{ inputs.compose-file }}
+          build-compose-file: ${{ inputs.build-compose-file }}
 
   quality:
     name: lint and test (${{ matrix.target.name }})

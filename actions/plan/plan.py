@@ -1,8 +1,14 @@
 """Plan one run of the service pipeline.
 
-Reads the caller's Compose file (already converted to JSON by yq, without interpolation), derives
-the run mode from the GitHub event, and decides which services and check-only directories the
-quality, build and carry jobs must handle. Results are written as compact JSON to $GITHUB_OUTPUT.
+Reads the caller's Compose file (already converted to JSON by yq, without interpolation), optionally
+merged with a build overlay, derives the run mode from the GitHub event, and decides which services
+and check-only directories the quality, build and carry jobs must handle. Results are written as
+compact JSON to $GITHUB_OUTPUT.
+
+The overlay exists because a deploy platform that sees `build:` (Coolify does) builds the image
+itself instead of pulling the one CI tested. The deploy file then lists only what runs, and the
+overlay (usually compose.override.yaml, which `docker compose` merges automatically) adds `build:`
+and `x-ci` for CI and local development.
 
 Standard library only: GitHub-hosted runners ship Python 3.12, so no 3.13+ syntax is used.
 """
@@ -262,6 +268,58 @@ def parse_compose(compose: dict[str, Any], compose_file: str) -> tuple[list[Serv
     return services, checks
 
 
+def merge_compose(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Merge a Compose overlay onto a base document, the way `docker compose -f base -f overlay` does
+    for the keys the pipeline reads.
+
+    Mappings are merged key by key; any other value in the overlay (string, list, number) replaces
+    the base value. Neither input is modified.
+
+    Args:
+        base: The deploy Compose document.
+        overlay: The build overlay document.
+
+    Returns:
+        A new merged document.
+    """
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_compose(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def check_owned_images_are_built(compose: dict[str, Any], owned_registry: str) -> None:
+    """Fail when a service runs an image from the caller's own registry namespace but nothing builds it.
+
+    With a build overlay, forgetting a service's `build:` there would leave CI never building an
+    image the deploy file expects to pull. A service whose image really comes from elsewhere can opt
+    out with `x-ci: {external: true}`.
+
+    Args:
+        compose: The merged Compose document.
+        owned_registry: Lowercase image prefix the repository owns, e.g. "ghcr.io/owner/".
+
+    Raises:
+        PlanError: Listing every service whose owned image has no build section.
+    """
+    unbuilt = []
+    for name, spec in (compose.get("services") or {}).items():
+        if not isinstance(spec, dict) or "build" in spec:
+            continue
+        image = spec.get("image")
+        x_ci = spec.get("x-ci") if isinstance(spec.get("x-ci"), dict) else {}
+        if isinstance(image, str) and image.lower().startswith(owned_registry) and not x_ci.get("external"):
+            unbuilt.append(name)
+    if unbuilt:
+        raise PlanError(
+            f"services {', '.join(unbuilt)} run an image under {owned_registry} but have no build section; "
+            "add one to the build overlay, or mark the service x-ci: {external: true} if another repository builds it"
+        )
+
+
 def _matches(globs: tuple[str, ...], changed: list[str]) -> bool:
     """Return True if any changed path matches any glob.
 
@@ -276,27 +334,41 @@ def build_plan(
     mode: str,
     sha: str,
     changed: list[str] | None,
+    build_overlay: dict[str, Any] | None = None,
+    build_compose_file: str | None = None,
+    owned_registry: str | None = None,
 ) -> dict[str, Any]:
     """Compute the job matrices for one pipeline run.
 
     Args:
-        compose: The Compose document as parsed JSON.
-        compose_file: Repo-relative path of the Compose file.
+        compose: The deploy Compose document as parsed JSON.
+        compose_file: Repo-relative path of the deploy Compose file. Relative paths in both files
+            resolve from its directory, as Docker Compose resolves them from the first file.
         mode: Result of resolve_mode.
         sha: Commit SHA the run is for (github.sha).
         changed: Repo-relative paths changed by this event, or None to treat everything as changed.
+        build_overlay: Optional Compose document adding `build:` and `x-ci`, merged onto compose.
+        build_compose_file: Repo-relative path of the overlay; a change to it rebuilds everything.
+        owned_registry: With an overlay, the image prefix the repository owns (e.g. "ghcr.io/owner/");
+            services under it must end up with a build section.
 
     Returns:
         A mapping with mode, sha-tag and the checks/build/carry/all lists.
 
     Raises:
-        PlanError: Propagated from parse_compose, or for a SHA that is too short.
+        PlanError: Propagated from parse_compose and check_owned_images_are_built, or for a SHA
+            that is too short.
     """
     if len(sha) < SHORT_SHA_LENGTH:
         raise PlanError(f"commit sha {sha!r} is too short")
+    if build_overlay is not None:
+        compose = merge_compose(compose, build_overlay)
+        if owned_registry:
+            check_owned_images_are_built(compose, owned_registry.lower())
     services, checks = parse_compose(compose, compose_file)
 
-    if changed is not None and _matches((compose_file, *GLOBAL_TRIGGERS), changed):
+    triggers = (compose_file, *((build_compose_file,) if build_compose_file else ()), *GLOBAL_TRIGGERS)
+    if changed is not None and _matches(triggers, changed):
         changed = None
 
     def touched(watch: tuple[str, ...]) -> bool:
@@ -367,14 +439,36 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ref", required=True, help="github.ref")
     parser.add_argument("--sha", required=True, help="github.sha")
     parser.add_argument("--changed-files", help="file listing changed paths; omit to treat everything as changed")
+    parser.add_argument("--build-compose-json", help="build overlay converted to JSON (optional)")
+    parser.add_argument("--build-compose-file", help="repo-relative path of the build overlay")
+    parser.add_argument("--owned-registry", help="image prefix the repository owns, e.g. ghcr.io/owner/")
     args = parser.parse_args(argv)
+    if bool(args.build_compose_json) != bool(args.build_compose_file):
+        parser.error("--build-compose-json and --build-compose-file must be given together")
 
     try:
         with open(args.compose_json, encoding="utf-8") as handle:
             compose = json.load(handle)
+        overlay = None
+        build_compose_file = None
+        if args.build_compose_json:
+            with open(args.build_compose_json, encoding="utf-8") as handle:
+                overlay = json.load(handle)
+            if not isinstance(overlay, dict):
+                raise PlanError(f"{args.build_compose_file}: the build overlay must be a mapping")
+            build_compose_file = posixpath.normpath(args.build_compose_file)
         changed = _read_changed(args.changed_files) if args.changed_files else None
         compose_file = posixpath.normpath(args.compose_file)
-        plan = build_plan(compose, compose_file, resolve_mode(args.event, args.ref), args.sha, changed)
+        plan = build_plan(
+            compose,
+            compose_file,
+            resolve_mode(args.event, args.ref),
+            args.sha,
+            changed,
+            build_overlay=overlay,
+            build_compose_file=build_compose_file,
+            owned_registry=args.owned_registry,
+        )
     except (PlanError, OSError, json.JSONDecodeError) as exc:
         print(f"::error title=plan::{exc}")
         return 1
