@@ -7,34 +7,16 @@ a Compose file and Makefiles instead of through pipeline configuration.
 
 ## How a repo uses it
 
-`.github/workflows/pipeline.yml` in the consuming repo:
+Copy [`templates/pipeline.yml`](templates/pipeline.yml) to `.github/workflows/pipeline.yml` in the
+consuming repo, then set `compose-file` and `deploy` in its `with:` block:
 
-```yaml
-name: pipeline
-on:
-  pull_request:
-    branches: [dev, main]
-  push:
-    branches: [dev]
-    tags: ["v*"]
-  workflow_dispatch:   # manual run = rebuild everything
-
-concurrency:   # publishes run in order so :dev moves in order; stale PR runs are cancelled
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
-permissions:   # ceiling for the template's jobs; each job asks for less
-  contents: write
-  packages: write
-
-jobs:
-  pipeline:
-    uses: giakiet05/ci-templates/.github/workflows/service.yml@main
-    with:
-      compose-file: compose.yaml   # default
-      deploy: coolify              # or none (default)
-    secrets: inherit
+```bash
+mkdir -p .github/workflows
+curl -fsSL https://raw.githubusercontent.com/giakiet05/ci-templates/main/templates/pipeline.yml -o .github/workflows/pipeline.yml
 ```
+
+The starter sets the triggers the pipeline expects (PRs into `dev`/`main`, pushes to `dev`, `v*`
+tags, manual runs), the concurrency group and the permission ceiling; keep those as they are.
 
 ## The contract
 
@@ -133,13 +115,14 @@ deploy job on a self-hosted runner: `with: { runs-on: <runner-label> }`.
 actions/plan/                    Compose + diff -> job matrices (Python, stdlib only, unit tested)
 actions/setup-toolchain/         Go / uv / Node from go.mod / pyproject.toml / package.json, then make ci-setup
 actions/deploy-coolify/          set TAG, trigger a Coolify deployment, wait for the result
+templates/pipeline.yml           starter workflow that consuming repos copy
 ```
 
 ## Working on this repo
 
 ```bash
 make test   # unit tests for actions/plan
-make lint   # actionlint (via Docker) on the workflows
+make lint   # actionlint (via Docker) on the workflows and the starter template
 ```
 
 All third-party actions are pinned to full commit SHAs; Dependabot proposes updates weekly.

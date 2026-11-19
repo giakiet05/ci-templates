@@ -1,0 +1,30 @@
+# Starter workflow for a repo that uses this template. Copy it to .github/workflows/pipeline.yml
+# in the consuming repo and adjust the `with:` block. See README.md for the repo contract.
+name: pipeline
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev]
+    tags: ["v*"]
+  workflow_dispatch: # manual run: lint, test and build every service
+
+concurrency:
+  # Publishes run in order so :dev moves in order; a newer push to a PR cancels its stale run.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Ceiling for the template's jobs; each job requests only what it needs.
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  pipeline:
+    uses: giakiet05/ci-templates/.github/workflows/service.yml@main
+    with:
+      compose-file: compose.yaml # deploy Compose file, repo-relative (default: compose.yaml)
+      deploy: none # coolify | none (default: none); coolify needs the COOLIFY_* secrets
+      # runs-on: ubuntu-latest # runner for the deploy job; a self-hosted label when Coolify is LAN-only
+    secrets: inherit

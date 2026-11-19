@@ -3,9 +3,11 @@ ACTIONLINT_IMAGE := rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47e
 
 .PHONY: lint test
 
-# Lint the workflow files (and the shell inside them) with actionlint.
+# Lint the workflow files (and the shell inside them) with actionlint, then the consumer starter
+# workflow, which lives outside .github/workflows so it does not run in this repo.
 lint:
 	docker run --rm -v "$(CURDIR):/repo:ro" -w /repo $(ACTIONLINT_IMAGE) -color
+	docker run --rm -v "$(CURDIR):/repo:ro" -w /repo $(ACTIONLINT_IMAGE) -color templates/pipeline.yml
 
 # Unit tests for the plan action; standard library only.
 test:
