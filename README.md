@@ -15,7 +15,7 @@ mkdir -p .github/workflows
 curl -fsSL https://raw.githubusercontent.com/giakiet05/ci-templates/main/templates/pipeline.yml -o .github/workflows/pipeline.yml
 ```
 
-The starter sets the triggers the pipeline expects (PRs into `dev`/`main`, pushes to `dev`, `v*`
+The starter sets the triggers the pipeline expects (PRs into `dev`/`main`, pushes to `main`, `v*`
 tags, manual runs), the concurrency group and the permission ceiling; keep those as they are.
 
 ## The contract
@@ -23,12 +23,12 @@ tags, manual runs), the concurrency group and the permission ceiling; keep those
 | # | The repo provides | Notes |
 |---|---|---|
 | 1 | A **deploy Compose file** (`compose-file` input, default `compose.yaml`) with **app services only** | Infrastructure (Postgres, Kafka...) belongs in `compose.dev.yaml` for local use. Coolify runs every service in the deploy file |
-| 2 | Every service CI builds has `image: ghcr.io/<owner>/<name>:${TAG:-dev}` | Lowercase. CI pushes to that repository with its own tags; the platform pulls it with `TAG=vX.Y.Z`. Services may share an image (e.g. a bootstrap job) only with identical `build:` sections; it is built once |
+| 2 | Every service CI builds has `image: ghcr.io/<owner>/<name>:${TAG:-main}` | Lowercase. CI pushes to that repository with its own tags; the platform pulls it with `TAG=vX.Y.Z`. Services may share an image (e.g. a bootstrap job) only with identical `build:` sections; it is built once |
 | 3 | The `build:` sections: in the deploy file, or in a **build overlay** (`build-compose-file` input, e.g. `compose.override.yaml`) | **Required for Coolify**: a deploy file with `build:` makes Coolify build the images on the server instead of pulling the ones CI tested and scanned. With an overlay, every service whose image is under `ghcr.io/<owner>/` must get a `build:` from it, unless marked `x-ci: {external: true}` |
 | 4 | A **Makefile next to each service's Dockerfile** with `lint` and `test` | Optional: `test-integration` (run after `test`), `ci-setup` (installs extra tools before anything else) |
 | 5 | Optional `x-ci` on a service | `watch`: extra repo-root globs that should rebuild it (shared code outside its folder). `path`: Makefile directory when it is not the Dockerfile's folder |
 | 6 | Optional top-level `x-ci.checks` | Directories that are linted and tested but have no image (shared libraries) |
-| 7 | Branch flow: PRs into `dev`; `dev` into `main` **fast-forward only**; releases are `v*` tags on `main` | Promotion finds images by commit SHA, so a merge commit on `main` would have no images |
+| 7 | Branch flow: PRs into `dev`; `dev` into `main` **by PR** (the normal merge button; "Create a merge commit" recommended); releases are `v*` tags on `main` commits whose pipeline finished green | Images are built from `main` only, so every change reaching them went through a reviewed, checked PR |
 
 Paths in `build:` follow Compose rules: relative to the deploy Compose file's directory, in the
 overlay too (Compose resolves every file from the first one). Paths in `x-ci` are relative to the
@@ -41,7 +41,7 @@ Example monorepo service, split for Coolify:
 # compose.yaml: what runs (Coolify reads only this file)
 services:
   api:
-    image: ghcr.io/owner/shop-api:${TAG:-dev}
+    image: ghcr.io/owner/shop-api:${TAG:-main}
     restart: unless-stopped
 ```
 
@@ -68,20 +68,27 @@ does not deploy to Coolify may keep everything in one file.
 
 | Event | Mode | Jobs (as named in the Actions UI) |
 |---|---|---|
-| PR into `dev` | check | plan run, lint and test, build image (no push) for changed services |
-| PR into `main` | check | the same, plus **check release images exist** (preflight): every image `:sha-<head>` must exist |
-| Push to `dev` | publish | lint and test, build image + push `:sha-<short>`, Trivy scan (critical, fixable), move `:dev`, **retag unchanged images** (carry) |
-| Manual run | publish | the same, treating every path as changed |
+| PR into `dev` or `main` | check | plan run, lint and test, build image (no push) for changed services |
+| Push to `main` (the PR merge) | publish | build image for **every** service, push `:sha-<short>`, Trivy scan (critical, fixable), move `:main`. No lint and test: the PR into `main` ran them on this code |
+| Manual run on `main` | publish | the same, e.g. to pick up a fixed base image |
 | Tag `v*` | release | **promote images to release** (`:sha-<short>` to `:vX.Y.Z`), **deploy release**, **create GitHub release** |
 
-Job IDs in `service.yml` stay short (`resolve`, `quality`, `build`, `carry`, `preflight`, `promote`,
-`deploy`, `release`); they are what `needs:` refers to.
+Pushes to `dev` run nothing (every change reached `dev` through a checked PR); a push or manual run
+on any branch other than `main` fails with a clear error. Job IDs in `service.yml` stay short
+(`resolve`, `quality`, `build`, `promote`, `deploy`, `release`); they are what `needs:` refers to.
 
-**Changed services** are those whose folder or `watch` globs match the diff. A change to the
-Compose file, the build overlay, `.github/` or `.trivyignore.yaml` counts as a change to everything.
+**Changed services** (pull requests only) are those whose folder or `watch` globs match the diff. A
+change to the Compose file, the build overlay or `.github/` counts as a change to everything.
+Publish ignores the diff and builds every image, so each `main` commit has a complete set to
+release; the layer cache keeps unchanged services fast.
 
-**Carry**: services that did not change are retagged from `:dev` to `:sha-<this commit>` (a
-manifest copy, no rebuild), so every commit on `dev` has a complete image set and can be released.
+**Checking a candidate before tagging** (no staging server needed): once the `main` pipeline is
+green, run the exact images a tag would release. `-f compose.yaml` skips the build overlay, so
+nothing is built locally:
+
+```bash
+TAG=sha-<short> docker compose -f compose.yaml up
+```
 
 **Accepting a scan finding**: when a critical CVE cannot be fixed yet (for example a JAR bundled
 by a dependency with no patched release), list it in `.trivyignore.yaml` at the repository root
@@ -116,6 +123,7 @@ actions/plan/                    Compose + diff -> job matrices (Python, stdlib 
 actions/setup-toolchain/         Go / uv / Node from go.mod / pyproject.toml / package.json, then make ci-setup
 actions/deploy-coolify/          set TAG, trigger a Coolify deployment, wait for the result
 templates/pipeline.yml           starter workflow that consuming repos copy
+docs/adr/                        why the pipeline is shaped this way (release model, build overlay)
 ```
 
 ## Working on this repo

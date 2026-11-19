@@ -22,11 +22,11 @@ def monorepo() -> dict:
         "x-ci": {"checks": ["apps/scraper/shared"]},
         "services": {
             "server": {
-                "image": "ghcr.io/owner/thesis-server:${TAG:-dev}",
+                "image": "ghcr.io/owner/thesis-server:${TAG:-main}",
                 "build": {"context": "../apps/server"},
             },
             "processor": {
-                "image": "ghcr.io/owner/thesis-processor:${TAG:-dev}",
+                "image": "ghcr.io/owner/thesis-processor:${TAG:-main}",
                 "build": {"context": "..", "dockerfile": "apps/processor/Dockerfile"},
                 "x-ci": {"watch": ["packages/**"]},
             },
@@ -41,11 +41,19 @@ class ResolveModeTest(unittest.TestCase):
     def test_pull_request_is_check(self) -> None:
         self.assertEqual(plan.resolve_mode("pull_request", "refs/pull/7/merge"), "check")
 
-    def test_branch_push_is_publish(self) -> None:
-        self.assertEqual(plan.resolve_mode("push", "refs/heads/dev"), "publish")
+    def test_main_push_is_publish(self) -> None:
+        self.assertEqual(plan.resolve_mode("push", "refs/heads/main"), "publish")
 
-    def test_manual_run_is_publish(self) -> None:
-        self.assertEqual(plan.resolve_mode("workflow_dispatch", "refs/heads/dev"), "publish")
+    def test_manual_run_on_main_is_publish(self) -> None:
+        self.assertEqual(plan.resolve_mode("workflow_dispatch", "refs/heads/main"), "publish")
+
+    def test_other_branch_push_is_rejected(self) -> None:
+        with self.assertRaisesRegex(plan.PlanError, "only from refs/heads/main"):
+            plan.resolve_mode("push", "refs/heads/dev")
+
+    def test_manual_run_on_other_branch_is_rejected(self) -> None:
+        with self.assertRaises(plan.PlanError):
+            plan.resolve_mode("workflow_dispatch", "refs/heads/dev")
 
     def test_version_tag_is_release(self) -> None:
         self.assertEqual(plan.resolve_mode("push", "refs/tags/v0.3.0"), "release")
@@ -63,7 +71,7 @@ class ImageRepositoryTest(unittest.TestCase):
     """Tag and digest stripping."""
 
     def test_strips_interpolated_tag(self) -> None:
-        self.assertEqual(plan.image_repository("ghcr.io/o/app:${TAG:-dev}", "s"), "ghcr.io/o/app")
+        self.assertEqual(plan.image_repository("ghcr.io/o/app:${TAG:-main}", "s"), "ghcr.io/o/app")
 
     def test_strips_digest(self) -> None:
         self.assertEqual(plan.image_repository("ghcr.io/o/app@sha256:abc", "s"), "ghcr.io/o/app")
@@ -95,7 +103,7 @@ class ParseComposeTest(unittest.TestCase):
         self.assertEqual([chk.dir for chk in checks], ["apps/scraper/shared"])
 
     def test_single_service_at_root(self) -> None:
-        compose = {"services": {"api": {"image": "ghcr.io/o/api:${TAG:-dev}", "build": "."}}}
+        compose = {"services": {"api": {"image": "ghcr.io/o/api:${TAG:-main}", "build": "."}}}
         (svc,), checks = plan.parse_compose(compose, "compose.yaml")
         self.assertEqual((svc.context, svc.dockerfile, svc.dir, svc.watch), (".", "Dockerfile", ".", ("**",)))
         self.assertEqual(checks, [])
@@ -136,8 +144,8 @@ class ParseComposeTest(unittest.TestCase):
     def test_shared_image_with_identical_build_is_built_once(self) -> None:
         compose = {
             "services": {
-                "server-bootstrap": {"image": "ghcr.io/o/server:${TAG:-dev}", "build": {"context": "../apps/server"}},
-                "server": {"image": "ghcr.io/o/server:${TAG:-dev}", "build": {"context": "../apps/server"}},
+                "server-bootstrap": {"image": "ghcr.io/o/server:${TAG:-main}", "build": {"context": "../apps/server"}},
+                "server": {"image": "ghcr.io/o/server:${TAG:-main}", "build": {"context": "../apps/server"}},
             }
         }
         services, _ = plan.parse_compose(compose, "deploy/compose.yaml")
@@ -169,53 +177,47 @@ class BuildPlanTest(unittest.TestCase):
     def names(self, result: dict, key: str) -> list[str]:
         return [item["name"] for item in result[key]]
 
-    def test_everything_when_changes_unknown(self) -> None:
-        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, None)
+    def test_check_everything_when_changes_unknown(self) -> None:
+        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "check", SHA, None)
         self.assertEqual(self.names(result, "build"), ["server", "processor"])
         self.assertEqual(self.names(result, "checks"), ["server", "processor", "apps/scraper/shared"])
-        self.assertEqual(result["carry"], [])
         self.assertEqual(result["sha-tag"], "sha-a1b2c3d")
 
-    def test_only_changed_service_is_built_and_rest_carried(self) -> None:
-        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, ["apps/server/main.go"])
+    def test_check_only_changed_service(self) -> None:
+        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "check", SHA, ["apps/server/main.go"])
         self.assertEqual(self.names(result, "build"), ["server"])
         self.assertEqual(self.names(result, "checks"), ["server"])
-        self.assertEqual(result["carry"], [{"name": "processor", "image": "ghcr.io/owner/thesis-processor"}])
 
-    def test_extra_watch_triggers_rebuild(self) -> None:
-        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, ["packages/contracts/x.py"])
+    def test_extra_watch_triggers_check(self) -> None:
+        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "check", SHA, ["packages/contracts/x.py"])
         self.assertEqual(self.names(result, "build"), ["processor"])
+
+    def test_publish_builds_every_image_and_skips_checks(self) -> None:
+        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, ["docs/readme.md"])
+        self.assertEqual(self.names(result, "build"), ["server", "processor"])
+        self.assertEqual(result["checks"], [])
+        self.assertNotIn("carry", result)
 
     def test_check_dir_change_runs_only_its_checks(self) -> None:
         result = plan.build_plan(monorepo(), "deploy/compose.yaml", "check", SHA, ["apps/scraper/shared/a.py"])
         self.assertEqual(self.names(result, "checks"), ["apps/scraper/shared"])
         self.assertEqual(result["build"], [])
 
-    def test_compose_change_rebuilds_everything(self) -> None:
-        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, ["deploy/compose.yaml"])
+    def test_compose_change_checks_everything(self) -> None:
+        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "check", SHA, ["deploy/compose.yaml"])
         self.assertEqual(self.names(result, "build"), ["server", "processor"])
 
-    def test_workflow_change_rebuilds_everything(self) -> None:
+    def test_workflow_change_checks_everything(self) -> None:
         result = plan.build_plan(monorepo(), "deploy/compose.yaml", "check", SHA, [".github/workflows/ci.yml"])
         self.assertEqual(self.names(result, "build"), ["server", "processor"])
 
-    def test_scan_ignore_change_rebuilds_everything(self) -> None:
-        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, [".trivyignore.yaml"])
-        self.assertEqual(self.names(result, "build"), ["server", "processor"])
-
-    def test_unrelated_change_builds_nothing_and_carries_all(self) -> None:
-        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, ["docs/readme.md"])
-        self.assertEqual(result["build"], [])
-        self.assertEqual(result["checks"], [])
-        self.assertEqual(self.names(result, "carry"), ["server", "processor"])
-
-    def test_check_mode_never_carries(self) -> None:
+    def test_unrelated_change_checks_nothing(self) -> None:
         result = plan.build_plan(monorepo(), "deploy/compose.yaml", "check", SHA, ["docs/readme.md"])
-        self.assertEqual(result["carry"], [])
+        self.assertEqual((result["build"], result["checks"]), ([], []))
 
     def test_release_only_lists_all_images(self) -> None:
         result = plan.build_plan(monorepo(), "deploy/compose.yaml", "release", SHA, None)
-        self.assertEqual((result["checks"], result["build"], result["carry"]), ([], [], []))
+        self.assertEqual((result["checks"], result["build"]), ([], []))
         self.assertEqual(self.names(result, "all"), ["server", "processor"])
 
     def test_build_entry_carries_docker_inputs(self) -> None:
@@ -234,8 +236,8 @@ def deploy_file() -> dict:
     """A deploy Compose file without build sections (what the platform runs)."""
     return {
         "services": {
-            "api": {"image": "ghcr.io/owner/app-api:${TAG:-dev}", "restart": "unless-stopped"},
-            "worker": {"image": "ghcr.io/owner/app-worker:${TAG:-dev}", "environment": {"X": "1"}},
+            "api": {"image": "ghcr.io/owner/app-api:${TAG:-main}", "restart": "unless-stopped"},
+            "worker": {"image": "ghcr.io/owner/app-worker:${TAG:-main}", "environment": {"X": "1"}},
             "db": {"image": "postgres:17"},
         },
     }
@@ -258,7 +260,7 @@ def build_overlay() -> dict:
 class BuildOverlayTest(unittest.TestCase):
     """A deploy file plus a build overlay behaves like one combined file."""
 
-    def plan_with_overlay(self, overlay: dict, changed: list[str] | None = None, mode: str = "publish") -> dict:
+    def plan_with_overlay(self, overlay: dict, changed: list[str] | None = None, mode: str = "check") -> dict:
         return plan.build_plan(
             deploy_file(),
             "compose.yaml",
@@ -280,9 +282,8 @@ class BuildOverlayTest(unittest.TestCase):
     def test_overlay_watch_applies(self) -> None:
         result = self.plan_with_overlay(build_overlay(), changed=["libs/shared/greeting.go"])
         self.assertEqual([item["name"] for item in result["build"]], ["api"])
-        self.assertEqual([item["name"] for item in result["carry"]], ["worker"])
 
-    def test_overlay_change_rebuilds_everything(self) -> None:
+    def test_overlay_change_checks_everything(self) -> None:
         result = self.plan_with_overlay(build_overlay(), changed=["compose.override.yaml"])
         self.assertEqual({item["name"] for item in result["build"]}, {"api", "worker"})
 
@@ -335,7 +336,7 @@ class MainTest(unittest.TestCase):
             "--compose-json", str(self.compose_json),
             "--compose-file", "deploy/compose.yaml",
             "--event", "push",
-            "--ref", "refs/heads/dev",
+            "--ref", "refs/heads/main",
             "--sha", SHA,
             *extra,
         ]
@@ -360,8 +361,9 @@ class MainTest(unittest.TestCase):
         out = self.outputs()
         self.assertEqual(out["mode"], "publish")
         self.assertEqual(out["sha-tag"], "sha-a1b2c3d")
-        self.assertEqual([item["name"] for item in json.loads(out["build"])], ["server"])
-        self.assertEqual([item["name"] for item in json.loads(out["carry"])], ["processor"])
+        # Publish ignores the change list and builds every image; there is no carry output.
+        self.assertEqual([item["name"] for item in json.loads(out["build"])], ["server", "processor"])
+        self.assertNotIn("carry", out)
 
     def test_build_overlay_flags(self) -> None:
         self.compose_json.write_text(json.dumps(deploy_file()), encoding="utf-8")
@@ -371,7 +373,7 @@ class MainTest(unittest.TestCase):
             "--compose-json", str(self.compose_json),
             "--compose-file", "compose.yaml",
             "--event", "push",
-            "--ref", "refs/heads/dev",
+            "--ref", "refs/heads/main",
             "--sha", SHA,
             "--build-compose-json", str(overlay_json),
             "--build-compose-file", "compose.override.yaml",

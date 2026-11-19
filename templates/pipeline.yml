@@ -6,12 +6,12 @@ on:
   pull_request:
     branches: [dev, main]
   push:
-    branches: [dev]
+    branches: [main] # merges into main build and push every image
     tags: ["v*"]
-  workflow_dispatch: # manual run: lint, test and build every service
+  workflow_dispatch: # manual run on main: rebuild every image (e.g. after a base-image fix)
 
 concurrency:
-  # Publishes run in order so :dev moves in order; a newer push to a PR cancels its stale run.
+  # Publishes run in order so :main moves in order; a newer push to a PR cancels its stale run.
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 

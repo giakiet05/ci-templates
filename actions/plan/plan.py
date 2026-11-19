@@ -2,7 +2,7 @@
 
 Reads the caller's Compose file (already converted to JSON by yq, without interpolation), optionally
 merged with a build overlay, derives the run mode from the GitHub event, and decides which services
-and check-only directories the quality, build and carry jobs must handle. Results are written as
+and check-only directories the quality and build jobs must handle. Results are written as
 compact JSON to $GITHUB_OUTPUT.
 
 The overlay exists because a deploy platform that sees `build:` (Coolify does) builds the image
@@ -24,10 +24,12 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
-# Changes under these paths can alter every job, so they rebuild everything. The scan's accepted
-# findings apply to every image, so editing them rescans all of them.
-GLOBAL_TRIGGERS: tuple[str, ...] = (".github/**", ".trivyignore.yaml")
+# In a pull request, changes under these paths can alter every job, so they check everything.
+# (.trivyignore.yaml needs no entry: the scan runs only on main, where every image is rebuilt.)
+GLOBAL_TRIGGERS: tuple[str, ...] = (".github/**",)
 SHORT_SHA_LENGTH = 7
+# The only branch whose pushes build and push images; releases are tags on its commits.
+PUBLISH_REF = "refs/heads/main"
 
 
 class PlanError(Exception):
@@ -82,21 +84,22 @@ def resolve_mode(event_name: str, ref: str) -> str:
         ref: Value of github.ref.
 
     Returns:
-        "check" for pull requests, "publish" for branch pushes and manual runs,
+        "check" for pull requests, "publish" for pushes and manual runs on the publish branch,
         "release" for pushed tags starting with "v".
 
     Raises:
-        PlanError: For events or refs the pipeline does not support.
+        PlanError: For events or refs the pipeline does not support, including a push or manual
+            run on any branch other than the publish branch.
     """
     if event_name == "pull_request":
         return "check"
-    if event_name == "workflow_dispatch":
-        return "publish"
-    if event_name == "push":
-        if ref.startswith("refs/tags/v"):
-            return "release"
-        if ref.startswith("refs/heads/"):
+    if event_name == "push" and ref.startswith("refs/tags/v"):
+        return "release"
+    if event_name in ("push", "workflow_dispatch"):
+        if ref == PUBLISH_REF:
             return "publish"
+        # Images are built only from main, which receives code through reviewed PRs.
+        raise PlanError(f"{event_name} on {ref}: images are published only from {PUBLISH_REF}")
     raise PlanError(f"unsupported trigger: event={event_name} ref={ref}")
 
 
@@ -104,7 +107,7 @@ def image_repository(image: str, service: str) -> str:
     """Strip the tag and digest from an image reference.
 
     Args:
-        image: Compose image value, e.g. ghcr.io/owner/app:${TAG:-dev}.
+        image: Compose image value, e.g. ghcr.io/owner/app:${TAG:-main}.
         service: Service name, used in error messages.
 
     Returns:
@@ -217,7 +220,7 @@ def parse_compose(compose: dict[str, Any], compose_file: str) -> tuple[list[Serv
 
         image = spec.get("image")
         if not isinstance(image, str) or not image:
-            raise PlanError(f"service {name}: a buildable service needs an image (e.g. ghcr.io/owner/{name}:${{TAG:-dev}})")
+            raise PlanError(f"service {name}: a buildable service needs an image (e.g. ghcr.io/owner/{name}:${{TAG:-main}})")
         repo = image_repository(image, name)
 
         context = _repo_path(compose_dir, str(build.get("context", ".")), f"service {name} build.context")
@@ -346,14 +349,20 @@ def build_plan(
             resolve from its directory, as Docker Compose resolves them from the first file.
         mode: Result of resolve_mode.
         sha: Commit SHA the run is for (github.sha).
-        changed: Repo-relative paths changed by this event, or None to treat everything as changed.
+        changed: Repo-relative paths changed by the pull request, or None to treat everything as
+            changed. Only check mode uses it.
         build_overlay: Optional Compose document adding `build:` and `x-ci`, merged onto compose.
-        build_compose_file: Repo-relative path of the overlay; a change to it rebuilds everything.
+        build_compose_file: Repo-relative path of the overlay; in a pull request, a change to it
+            checks everything.
         owned_registry: With an overlay, the image prefix the repository owns (e.g. "ghcr.io/owner/");
             services under it must end up with a build section.
 
     Returns:
-        A mapping with mode, sha-tag and the checks/build/carry/all lists.
+        A mapping with mode, sha-tag and the checks/build/all lists:
+        - check: lint, test and build (without pushing) only what the pull request touches.
+        - publish: build every image, so each main commit has a complete set to release; no lint
+          or test, because the pull request into main already ran them on this code.
+        - release: nothing to check or build; promote uses the all list.
 
     Raises:
         PlanError: Propagated from parse_compose and check_owned_images_are_built, or for a SHA
@@ -367,24 +376,27 @@ def build_plan(
             check_owned_images_are_built(compose, owned_registry.lower())
     services, checks = parse_compose(compose, compose_file)
 
-    triggers = (compose_file, *((build_compose_file,) if build_compose_file else ()), *GLOBAL_TRIGGERS)
-    if changed is not None and _matches(triggers, changed):
-        changed = None
+    check_targets: list[dict[str, str]] = []
+    build_services: list[Service] = []
+    if mode == "check":
+        triggers = (compose_file, *((build_compose_file,) if build_compose_file else ()), *GLOBAL_TRIGGERS)
+        if changed is not None and _matches(triggers, changed):
+            changed = None
 
-    def touched(watch: tuple[str, ...]) -> bool:
-        return changed is None or _matches(watch, changed)
+        def touched(watch: tuple[str, ...]) -> bool:
+            return changed is None or _matches(watch, changed)
 
-    changed_services = [svc for svc in services if touched(svc.watch)]
-    changed_checks = [chk for chk in checks if touched(chk.watch)]
+        build_services = [svc for svc in services if touched(svc.watch)]
+        check_targets = [{"name": svc.name, "dir": svc.dir} for svc in build_services]
+        check_targets += [{"name": chk.name, "dir": chk.dir} for chk in checks if touched(chk.watch)]
+    elif mode == "publish":
+        build_services = services
 
-    if mode == "release":
-        check_targets: list[dict[str, str]] = []
-        build: list[dict[str, Any]] = []
-        carry: list[dict[str, str]] = []
-    else:
-        check_targets = [{"name": svc.name, "dir": svc.dir} for svc in changed_services]
-        check_targets += [{"name": chk.name, "dir": chk.dir} for chk in changed_checks]
-        build = [
+    return {
+        "mode": mode,
+        "sha-tag": f"sha-{sha[:SHORT_SHA_LENGTH]}",
+        "checks": check_targets,
+        "build": [
             {
                 "name": svc.name,
                 "image": svc.image,
@@ -393,21 +405,8 @@ def build_plan(
                 "target": svc.target,
                 "args": "\n".join(svc.args),
             }
-            for svc in changed_services
-        ]
-        built = {svc.name for svc in changed_services}
-        carry = (
-            [{"name": svc.name, "image": svc.image} for svc in services if svc.name not in built]
-            if mode == "publish"
-            else []
-        )
-
-    return {
-        "mode": mode,
-        "sha-tag": f"sha-{sha[:SHORT_SHA_LENGTH]}",
-        "checks": check_targets,
-        "build": build,
-        "carry": carry,
+            for svc in build_services
+        ],
         "all": [{"name": svc.name, "image": svc.image} for svc in services],
     }
 
@@ -478,7 +477,7 @@ def main(argv: list[str] | None = None) -> int:
         write_outputs(plan, output_path)
     scope = "all paths" if changed is None else f"{len(changed)} changed paths"
     print(f"plan mode={plan['mode']} sha_tag={plan['sha-tag']} scope=\"{scope}\"")
-    for key in ("checks", "build", "carry"):
+    for key in ("checks", "build"):
         names = ", ".join(item["name"] for item in plan[key]) or "-"
         print(f"plan {key}: {names}")
     return 0

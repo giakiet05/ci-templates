@@ -1,7 +1,7 @@
 name: plan
 description: >-
-  Decide the run mode and which services to check, build and carry, from the caller's Compose
-  file and the paths changed by the triggering event. Requires a checkout with full history.
+  Decide the run mode and which services to check and build, from the caller's Compose file and,
+  for pull requests, the changed paths. Requires a checkout with full history.
 
 inputs:
   compose-file:
@@ -27,9 +27,6 @@ outputs:
   build:
     description: JSON list of {name, image, context, dockerfile, target, args} to build.
     value: ${{ steps.plan.outputs.build }}
-  carry:
-    description: JSON list of {name, image} to retag from :dev (publish mode only).
-    value: ${{ steps.plan.outputs.carry }}
   all:
     description: JSON list of {name, image} for every image the repo owns.
     value: ${{ steps.plan.outputs.all }}
@@ -43,25 +40,15 @@ runs:
       env:
         EVENT: ${{ github.event_name }}
         PR_BASE: ${{ github.event.pull_request.base.sha }}
-        PUSH_BEFORE: ${{ github.event.before }}
       run: |
         set -euo pipefail
+        # Only pull requests use change detection; publish builds every image and release builds none.
         file="$RUNNER_TEMP/changed-paths.txt"
         scope=all
-        case "$EVENT" in
-          pull_request)
-            git diff --name-only "$PR_BASE" "$GITHUB_SHA" > "$file"
-            scope=list
-            ;;
-          push)
-            # A new branch has no usable "before" commit; build everything in that case.
-            if [[ "$GITHUB_REF" == refs/heads/* && -n "$PUSH_BEFORE" && ! "$PUSH_BEFORE" =~ ^0+$ ]] \
-              && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
-              git diff --name-only "$PUSH_BEFORE" "$GITHUB_SHA" > "$file"
-              scope=list
-            fi
-            ;;
-        esac
+        if [ "$EVENT" = pull_request ]; then
+          git diff --name-only "$PR_BASE" "$GITHUB_SHA" > "$file"
+          scope=list
+        fi
         echo "scope=$scope" >> "$GITHUB_OUTPUT"
         echo "file=$file" >> "$GITHUB_OUTPUT"
 

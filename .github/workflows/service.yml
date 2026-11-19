@@ -1,8 +1,8 @@
 # Reusable pipeline for container services. See README.md for the repo contract.
 #
-#   pull_request    -> check:   quality + build (no push) for changed services
-#   push to branch  -> publish: quality + build + push :sha-<short>, scan, move :dev, carry the rest
-#   push tag v*     -> release: promote :sha-<short> to the tag, deploy, GitHub Release
+#   pull_request          -> check:   lint, test and build (no push) for changed services
+#   push to main / manual -> publish: build every image, push :sha-<short>, scan, move :main
+#   push tag v*           -> release: promote :sha-<short> to the tag, deploy, GitHub Release
 name: service
 
 on:
@@ -45,7 +45,6 @@ jobs:
       sha-tag: ${{ steps.plan.outputs.sha-tag }}
       checks: ${{ steps.plan.outputs.checks }}
       build: ${{ steps.plan.outputs.build }}
-      carry: ${{ steps.plan.outputs.carry }}
       all: ${{ steps.plan.outputs.all }}
     steps:
       - name: Validate inputs
@@ -61,7 +60,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Plan checks, builds and carries
+      - name: Plan checks and builds
         id: plan
         uses: giakiet05/ci-templates/actions/plan@main
         with:
@@ -71,7 +70,8 @@ jobs:
   quality:
     name: lint and test (${{ matrix.target.name }})
     needs: resolve
-    if: needs.resolve.outputs.mode != 'release' && needs.resolve.outputs.checks != '[]'
+    # Pull requests only: publish skips lint and test because the PR into main already ran them.
+    if: needs.resolve.outputs.checks != '[]'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -113,7 +113,12 @@ jobs:
   build:
     name: build image (${{ matrix.svc.name }})
     needs: [resolve, quality]
-    if: needs.resolve.outputs.mode != 'release' && needs.resolve.outputs.build != '[]'
+    # always() lets publish build although lint and test were skipped; a failed check still blocks it.
+    if: >-
+      always()
+      && needs.resolve.result == 'success'
+      && needs.resolve.outputs.build != '[]'
+      && contains(fromJSON('["success","skipped"]'), needs.quality.result)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -165,76 +170,10 @@ jobs:
           # Accepted findings (with reason and expiry) live in the caller's .trivyignore.yaml; the action fails on a
           # missing file, so it is passed only when the repository has one.
           trivyignores: ${{ hashFiles('.trivyignore.yaml') != '' && '.trivyignore.yaml' || '' }}
-      # :dev moves only after the scan passes, so carry never copies a rejected image.
-      - name: Move the dev tag
+      # :main moves only after the scan passes, so it always names the newest image that passed.
+      - name: Move the main tag
         if: env.PUBLISH == 'true'
-        run: docker buildx imagetools create --tag "$IMAGE:dev" "$IMAGE:$SHA_TAG"
-
-  carry:
-    name: retag unchanged images
-    needs: [resolve, build]
-    # Runs when nothing was built too (build skipped), so every commit gets a full image set.
-    if: >-
-      always()
-      && needs.resolve.result == 'success'
-      && needs.resolve.outputs.mode == 'publish'
-      && needs.resolve.outputs.carry != '[]'
-      && contains(fromJSON('["success","skipped"]'), needs.build.result)
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-    env:
-      CARRY: ${{ needs.resolve.outputs.carry }}
-      SHA_TAG: ${{ needs.resolve.outputs.sha-tag }}
-    steps:
-      - name: Log in to GHCR
-        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - name: Retag unchanged images to this commit
-        run: |
-          set -euo pipefail
-          for image in $(jq -r '.[].image' <<<"$CARRY"); do
-            if ! docker buildx imagetools create --tag "$image:$SHA_TAG" "$image:dev"; then
-              echo "::error title=carry::$image:dev does not exist yet; run this workflow manually (workflow_dispatch) to build everything"
-              exit 1
-            fi
-            echo "carried $image:dev -> $image:$SHA_TAG"
-          done
-
-  preflight:
-    name: check release images exist
-    needs: resolve
-    if: github.event_name == 'pull_request' && github.base_ref == 'main'
-    runs-on: ubuntu-latest
-    permissions:
-      packages: read
-    env:
-      ALL: ${{ needs.resolve.outputs.all }}
-      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-    steps:
-      - name: Log in to GHCR
-        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-      - name: Check every image exists for the release candidate
-        run: |
-          set -euo pipefail
-          tag="sha-${HEAD_SHA:0:7}"
-          missing=0
-          for image in $(jq -r '.[].image' <<<"$ALL"); do
-            if docker buildx imagetools inspect "$image:$tag" >/dev/null 2>&1; then
-              echo "found $image:$tag"
-            else
-              echo "::error title=preflight::$image:$tag is missing; merge the change into dev first"
-              missing=1
-            fi
-          done
-          exit "$missing"
+        run: docker buildx imagetools create --tag "$IMAGE:main" "$IMAGE:$SHA_TAG"
 
   promote:
     name: promote images to release
@@ -260,7 +199,7 @@ jobs:
           # Verify the whole set first so a release is all-or-nothing.
           for image in $images; do
             if ! docker buildx imagetools inspect "$image:$SHA_TAG" >/dev/null 2>&1; then
-              echo "::error title=promote::$image:$SHA_TAG is missing; tag a commit that passed the dev pipeline"
+              echo "::error title=promote::$image:$SHA_TAG is missing; tag a main commit whose pipeline has finished green"
               exit 1
             fi
           done
