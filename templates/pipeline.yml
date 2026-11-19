@@ -25,6 +25,7 @@ jobs:
     uses: giakiet05/ci-templates/.github/workflows/service.yml@main
     with:
       compose-file: compose.yaml # deploy Compose file, repo-relative (default: compose.yaml)
+      # build-compose-file: compose.override.yaml # build overlay; required when deploying to Coolify
       deploy: none # coolify | none (default: none); coolify needs the COOLIFY_* secrets
       # runs-on: ubuntu-latest # runner for the deploy job; a self-hosted label when Coolify is LAN-only
     secrets: inherit
