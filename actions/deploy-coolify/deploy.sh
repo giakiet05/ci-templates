@@ -12,7 +12,8 @@
 #
 # Exit status: 0 when Coolify reports the deployment finished, 1 on failure, cancel or timeout.
 #
-# Coolify v4 API endpoints used: PATCH /applications/{uuid}/envs, POST /deploy, GET /deployments/{uuid}.
+# Coolify v4 API endpoints used: PATCH /applications/{uuid}/envs (write), POST /deploy (deploy),
+# GET /deployments/{uuid} (read); the token needs all three permissions.
 set -euo pipefail
 
 : "${VERSION:?VERSION is required}"
