@@ -1,7 +1,10 @@
 # Reusable pipeline for container services. See README.md for the repo contract.
 #
-#   pull_request          -> check:   lint, test and build (no push) for changed services
-#   push to main / manual -> publish: build every image, push :sha-<short>, scan, move :main
+#   pull_request          -> check:   lint, test and build (no push) for changed services;
+#                                     nothing for a dev -> main PR that adds nothing beyond dev
+#   push to main          -> publish: build changed images, retag the rest from the previous main
+#                                     commit; push :sha-<short>, scan, move :main
+#   manual run on main    -> publish: build every image (e.g. after a base-image fix)
 #   push tag v*           -> release: promote :sha-<short> to the tag, deploy, GitHub Release
 name: service
 
@@ -18,6 +21,12 @@ on:
           services' build sections and x-ci. Use it when the deploy platform must only pull images.
         type: string
         default: ""
+      promotion-branch:
+        description: >-
+          Branch whose pull requests into main skip lint, test and build when the merge adds nothing
+          beyond it, since every commit on it was checked in its own pull request. Empty to always check.
+        type: string
+        default: dev
       deploy:
         description: Deploy target for releases (coolify | none).
         type: string
@@ -72,11 +81,12 @@ jobs:
         with:
           compose-file: ${{ inputs.compose-file }}
           build-compose-file: ${{ inputs.build-compose-file }}
+          promotion-branch: ${{ inputs.promotion-branch }}
 
   quality:
     name: lint and test (${{ matrix.target.name }})
     needs: resolve
-    # Pull requests only: publish skips lint and test because the PR into main already ran them.
+    # Pull requests only: publish skips lint and test because the PRs that brought the code in ran them.
     if: needs.resolve.outputs.checks != '[]'
     runs-on: ubuntu-latest
     permissions:
@@ -117,6 +127,7 @@ jobs:
           fi
 
   build:
+    # In publish, entries with carry-from are retagged from the previous main commit instead of rebuilt.
     name: build image (${{ matrix.svc.name }})
     needs: [resolve, quality]
     # always() lets publish build although lint and test were skipped; a failed check still blocks it.
@@ -137,11 +148,8 @@ jobs:
       PUBLISH: ${{ needs.resolve.outputs.mode == 'publish' }}
       IMAGE: ${{ matrix.svc.image }}
       SHA_TAG: ${{ needs.resolve.outputs.sha-tag }}
+      CARRY_FROM: ${{ matrix.svc.carry-from }}
     steps:
-      - name: Check out code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Log in to GHCR
@@ -151,7 +159,42 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      # The source is an immutable sha tag of the previous main commit, built from the same build
+      # inputs, so the copy is exactly what a rebuild would produce. A missing source (that run was
+      # cancelled or failed before pushing) falls through to a real build.
+      - name: Carry the image from ${{ env.CARRY_FROM }}
+        id: carry
+        if: env.PUBLISH == 'true' && env.CARRY_FROM != ''
+        run: |
+          set -euo pipefail
+          digest_of() {
+            docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$1" 2>/dev/null
+          }
+          if ! source_digest=$(digest_of "$IMAGE:$CARRY_FROM"); then
+            echo "::warning title=carry::$IMAGE:$CARRY_FROM is missing; building the image instead"
+            echo "carried=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          docker buildx imagetools create --tag "$IMAGE:$SHA_TAG" "$IMAGE:$CARRY_FROM"
+          echo "carried $IMAGE:$CARRY_FROM -> $IMAGE:$SHA_TAG ($source_digest)"
+          # :main moves only after a passed scan, so a source equal to :main needs no rescan; any
+          # other source (its scan failed, or :main is older) is scanned below.
+          main_digest=$(digest_of "$IMAGE:main" || true)
+          scanned=false
+          if [ "$source_digest" = "$main_digest" ]; then
+            scanned=true
+          fi
+          {
+            echo "carried=true"
+            echo "scanned=$scanned"
+          } >> "$GITHUB_OUTPUT"
+      - name: Check out code
+        if: steps.carry.outputs.carried != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Build${{ env.PUBLISH == 'true' && ' and push' || '' }}
+        if: steps.carry.outputs.carried != 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ matrix.svc.context }}
@@ -163,7 +206,7 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.svc.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.svc.name }}
       - name: Scan for critical vulnerabilities
-        if: env.PUBLISH == 'true'
+        if: env.PUBLISH == 'true' && steps.carry.outputs.scanned != 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         env:
           TRIVY_USERNAME: ${{ github.actor }}

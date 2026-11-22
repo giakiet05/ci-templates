@@ -1,7 +1,7 @@
 name: plan
 description: >-
-  Decide the run mode and which services to check and build, from the caller's Compose file and,
-  for pull requests, the changed paths. Requires a checkout with full history.
+  Decide the run mode and which services to check, build or carry over, from the caller's Compose
+  file and the paths changed since the base commit. Requires a checkout with full history.
 
 inputs:
   compose-file:
@@ -13,6 +13,12 @@ inputs:
       services' build sections and x-ci, merged onto the deploy file. Empty for a single file.
     required: false
     default: ""
+  promotion-branch:
+    description: >-
+      Branch whose pull requests into main skip lint, test and build when the merge adds nothing
+      beyond that branch (its commits were checked when they entered it). Empty to always check.
+    required: false
+    default: dev
 
 outputs:
   mode:
@@ -25,7 +31,9 @@ outputs:
     description: JSON list of {name, dir} to lint and test.
     value: ${{ steps.plan.outputs.checks }}
   build:
-    description: JSON list of {name, image, context, dockerfile, target, args} to build.
+    description: >-
+      JSON list of {name, image, context, dockerfile, target, args, carry-from} to build; a
+      non-empty carry-from names the tag to retag the image from instead of building it.
     value: ${{ steps.plan.outputs.build }}
   all:
     description: JSON list of {name, image} for every image the repo owns.
@@ -40,17 +48,50 @@ runs:
       env:
         EVENT: ${{ github.event_name }}
         PR_BASE: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        PUSH_BEFORE: ${{ github.event.before }}
+        PROMOTION_BRANCH: ${{ inputs.promotion-branch }}
       run: |
         set -euo pipefail
-        # Only pull requests use change detection; publish builds every image and release builds none.
+        # The base is the commit the change list is computed against: the pull request's base, or
+        # for a push to main the previous main commit, whose images the publish carries over.
+        # Without one (manual run, first push, force push) everything counts as changed.
         file="$RUNNER_TEMP/changed-paths.txt"
-        scope=all
+        base=""
         if [ "$EVENT" = pull_request ]; then
-          git diff --name-only "$PR_BASE" "$GITHUB_SHA" > "$file"
-          scope=list
+          base="$PR_BASE"
+        elif [ "$EVENT" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+          if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != 0000000000000000000000000000000000000000 ] \
+            && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+            base="$PUSH_BEFORE"
+          else
+            echo "::notice title=plan::no previous main commit to compare with; building every image"
+          fi
         fi
-        echo "scope=$scope" >> "$GITHUB_OUTPUT"
-        echo "file=$file" >> "$GITHUB_OUTPUT"
+        if [ -n "$base" ]; then
+          git diff --name-only "$base" "$GITHUB_SHA" > "$file"
+        fi
+
+        # A promotion pull request (promotion branch -> main, same repository) skips the checks only
+        # when the merge result has exactly the branch tip's tree, i.e. main adds nothing unchecked.
+        promotion=false
+        if [ "$EVENT" = pull_request ] && [ -n "$PROMOTION_BRANCH" ] && [ "$PR_BASE_REF" = main ] \
+          && [ "$PR_HEAD_REF" = "$PROMOTION_BRANCH" ] && [ "$PR_HEAD_REPO" = "$GITHUB_REPOSITORY" ]; then
+          merge_tree=$(git rev-parse "$GITHUB_SHA^{tree}")
+          if head_tree=$(git rev-parse --verify --quiet "$PR_HEAD^{tree}") && [ "$merge_tree" = "$head_tree" ]; then
+            promotion=true
+          else
+            echo "::notice title=plan::main has changes $PROMOTION_BRANCH lacks; checking the pull request normally"
+          fi
+        fi
+        {
+          echo "base=$base"
+          echo "file=$file"
+          echo "promotion=$promotion"
+        } >> "$GITHUB_OUTPUT"
 
     - name: Plan the run
       id: plan
@@ -60,8 +101,9 @@ runs:
         BUILD_COMPOSE_FILE: ${{ inputs.build-compose-file }}
         OWNER: ${{ github.repository_owner }}
         EVENT: ${{ github.event_name }}
-        SCOPE: ${{ steps.changed.outputs.scope }}
+        BASE: ${{ steps.changed.outputs.base }}
         CHANGED_FILE: ${{ steps.changed.outputs.file }}
+        PROMOTION: ${{ steps.changed.outputs.promotion }}
       run: |
         set -euo pipefail
         for file in "$COMPOSE_FILE" ${BUILD_COMPOSE_FILE:+"$BUILD_COMPOSE_FILE"}; do
@@ -88,7 +130,23 @@ runs:
             --owned-registry "ghcr.io/${OWNER,,}/"
           )
         fi
-        if [ "$SCOPE" = list ]; then
-          args+=(--changed-files "$CHANGED_FILE")
+        if [ -n "$BASE" ]; then
+          args+=(--changed-files "$CHANGED_FILE" --base-sha "$BASE")
+          # The Compose files at the base let a Compose edit rebuild only the services whose build
+          # definition changed. A file missing at the base is passed as absent: the deploy file
+          # then counts as wholly changed, a missing overlay makes the base incomparable.
+          if git cat-file -e "$BASE:$COMPOSE_FILE" 2>/dev/null; then
+            git show "$BASE:$COMPOSE_FILE" > "$RUNNER_TEMP/base-compose.yaml"
+            yq -o=json 'explode(.)' "$RUNNER_TEMP/base-compose.yaml" > "$RUNNER_TEMP/base-compose.json"
+            args+=(--base-compose-json "$RUNNER_TEMP/base-compose.json")
+            if [ -n "$BUILD_COMPOSE_FILE" ] && git cat-file -e "$BASE:$BUILD_COMPOSE_FILE" 2>/dev/null; then
+              git show "$BASE:$BUILD_COMPOSE_FILE" > "$RUNNER_TEMP/base-compose-build.yaml"
+              yq -o=json 'explode(.)' "$RUNNER_TEMP/base-compose-build.yaml" > "$RUNNER_TEMP/base-compose-build.json"
+              args+=(--base-build-compose-json "$RUNNER_TEMP/base-compose-build.json")
+            fi
+          fi
+        fi
+        if [ "$PROMOTION" = true ]; then
+          args+=(--promotion)
         fi
         python3 "$GITHUB_ACTION_PATH/plan.py" "${args[@]}"

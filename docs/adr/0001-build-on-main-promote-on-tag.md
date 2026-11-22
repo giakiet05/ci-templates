@@ -1,6 +1,6 @@
 # 1. Build images on main, promote them on tag
 
-- Status: accepted
+- Status: accepted, amended by [ADR-0003](0003-build-only-changed-images.md) (publish builds only changed images)
 - Date: 2026-11-19
 
 ## Context

@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [dev, main]
   push:
-    branches: [main] # merges into main build and push every image
+    branches: [main] # merges into main build changed images and retag the rest
     tags: ["v*"]
   workflow_dispatch: # manual run on main: rebuild every image (e.g. after a base-image fix)
 
@@ -26,6 +26,7 @@ jobs:
     with:
       compose-file: compose.yaml # deploy Compose file, repo-relative (default: compose.yaml)
       # build-compose-file: compose.override.yaml # build overlay; required when deploying to Coolify
+      # promotion-branch: dev # PRs from it into main skip checks when they add nothing beyond it ("" = always check)
       deploy: none # coolify | none (default: none); coolify needs the COOLIFY_* secrets
       # runs-on: ubuntu-latest # runner for the deploy job; a self-hosted label when Coolify is LAN-only
     secrets: inherit

@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import plan  # noqa: E402
 
 SHA = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+BASE_SHA = "f0e1d2c3b4a5968778695a4b3c2d1e0f9a8b7c6d"
 
 
 def monorepo() -> dict:
@@ -192,18 +193,57 @@ class BuildPlanTest(unittest.TestCase):
         result = plan.build_plan(monorepo(), "deploy/compose.yaml", "check", SHA, ["packages/contracts/x.py"])
         self.assertEqual(self.names(result, "build"), ["processor"])
 
-    def test_publish_builds_every_image_and_skips_checks(self) -> None:
-        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, ["docs/readme.md"])
+    def test_publish_without_changes_builds_every_image_and_skips_checks(self) -> None:
+        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, None)
         self.assertEqual(self.names(result, "build"), ["server", "processor"])
+        self.assertEqual([item["carry-from"] for item in result["build"]], ["", ""])
         self.assertEqual(result["checks"], [])
-        self.assertNotIn("carry", result)
+
+    def test_publish_builds_changed_and_carries_the_rest(self) -> None:
+        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, ["apps/server/main.go"],
+                                 base_sha=BASE_SHA)
+        carry = {item["name"]: item["carry-from"] for item in result["build"]}
+        self.assertEqual(carry, {"server": "", "processor": "sha-f0e1d2c"})
+        self.assertEqual(result["checks"], [])
+
+    def test_publish_unrelated_change_carries_everything(self) -> None:
+        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, ["docs/readme.md"],
+                                 base_sha=BASE_SHA)
+        self.assertEqual([item["carry-from"] for item in result["build"]], ["sha-f0e1d2c"] * 2)
+        self.assertEqual(self.names(result, "all"), ["server", "processor"])
+
+    def test_publish_workflow_change_builds_everything(self) -> None:
+        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, [".github/workflows/x.yml"],
+                                 base_sha=BASE_SHA)
+        self.assertEqual([item["carry-from"] for item in result["build"]], ["", ""])
+
+    def test_publish_runtime_compose_edit_carries_everything(self) -> None:
+        head = monorepo()
+        head["services"]["server"]["restart"] = "no"
+        result = plan.build_plan(head, "deploy/compose.yaml", "publish", SHA, ["deploy/compose.yaml"],
+                                 base=(monorepo(), None), base_sha=BASE_SHA)
+        self.assertEqual([item["carry-from"] for item in result["build"]], ["sha-f0e1d2c"] * 2)
+
+    def test_publish_change_list_needs_base_sha(self) -> None:
+        with self.assertRaisesRegex(plan.PlanError, "base commit"):
+            plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, ["apps/server/main.go"])
+
+    def test_promotion_checks_and_builds_nothing(self) -> None:
+        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "check", SHA, ["apps/server/main.go"],
+                                 promotion=True)
+        self.assertEqual((result["checks"], result["build"]), ([], []))
+        self.assertEqual(self.names(result, "all"), ["server", "processor"])
+
+    def test_promotion_flag_does_not_affect_publish(self) -> None:
+        result = plan.build_plan(monorepo(), "deploy/compose.yaml", "publish", SHA, None, promotion=True)
+        self.assertEqual(self.names(result, "build"), ["server", "processor"])
 
     def test_check_dir_change_runs_only_its_checks(self) -> None:
         result = plan.build_plan(monorepo(), "deploy/compose.yaml", "check", SHA, ["apps/scraper/shared/a.py"])
         self.assertEqual(self.names(result, "checks"), ["apps/scraper/shared"])
         self.assertEqual(result["build"], [])
 
-    def test_compose_change_checks_everything(self) -> None:
+    def test_compose_change_without_base_checks_everything(self) -> None:
         result = plan.build_plan(monorepo(), "deploy/compose.yaml", "check", SHA, ["deploy/compose.yaml"])
         self.assertEqual(self.names(result, "build"), ["server", "processor"])
 
@@ -225,11 +265,98 @@ class BuildPlanTest(unittest.TestCase):
         processor = result["build"][1]
         self.assertEqual(processor["context"], ".")
         self.assertEqual(processor["dockerfile"], "apps/processor/Dockerfile")
-        self.assertEqual((processor["target"], processor["args"]), ("", ""))
+        self.assertEqual((processor["target"], processor["args"], processor["carry-from"]), ("", "", ""))
 
     def test_short_sha_is_rejected(self) -> None:
         with self.assertRaises(plan.PlanError):
             plan.build_plan(monorepo(), "deploy/compose.yaml", "check", "abc", None)
+
+
+class ComposeDiffTest(unittest.TestCase):
+    """A Compose edit selects only the services whose build definition changed."""
+
+    def check(self, head: dict, base: dict, changed: list[str] | None = None) -> dict:
+        return plan.build_plan(head, "deploy/compose.yaml", "check", SHA,
+                               changed or ["deploy/compose.yaml"], base=(base, None))
+
+    def names(self, result: dict, key: str) -> list[str]:
+        return [item["name"] for item in result[key]]
+
+    def test_runtime_only_edit_builds_nothing(self) -> None:
+        head = monorepo()
+        head["services"]["server"].update(restart="no", environment={"A": "1"}, ports=["8080:8080"],
+                                          healthcheck={"test": ["CMD", "true"]}, networks=["edge"])
+        head["services"]["kafka"]["restart"] = "always"
+        result = self.check(head, monorepo())
+        self.assertEqual((result["build"], result["checks"]), ([], []))
+
+    def test_build_arg_change_builds_that_service(self) -> None:
+        head = monorepo()
+        head["services"]["processor"]["build"]["args"] = {"MODEL": "large"}
+        self.assertEqual(self.names(self.check(head, monorepo()), "build"), ["processor"])
+
+    def test_dockerfile_and_target_changes_count(self) -> None:
+        head = monorepo()
+        head["services"]["server"]["build"] = {"context": "../apps/server", "target": "prod"}
+        head["services"]["processor"]["build"]["dockerfile"] = "apps/processor/Dockerfile.gpu"
+        self.assertEqual(self.names(self.check(head, monorepo()), "build"), ["server", "processor"])
+
+    def test_image_rename_builds_that_service(self) -> None:
+        head = monorepo()
+        head["services"]["server"]["image"] = "ghcr.io/owner/thesis-api:${TAG:-main}"
+        self.assertEqual(self.names(self.check(head, monorepo()), "build"), ["server"])
+
+    def test_image_tag_change_builds_nothing(self) -> None:
+        head = monorepo()
+        head["services"]["server"]["image"] = "ghcr.io/owner/thesis-server:${TAG:-latest}"
+        self.assertEqual(self.check(head, monorepo())["build"], [])
+
+    def test_watch_change_builds_that_service(self) -> None:
+        head = monorepo()
+        head["services"]["processor"]["x-ci"]["watch"] = ["packages/**", "proto/**"]
+        result = self.check(head, monorepo())
+        self.assertEqual(self.names(result, "build"), ["processor"])
+        self.assertEqual(self.names(result, "checks"), ["processor"])
+
+    def test_new_service_builds_only_it(self) -> None:
+        head = monorepo()
+        head["services"]["scraper"] = {"image": "ghcr.io/owner/thesis-scraper:${TAG:-main}",
+                                       "build": {"context": "../apps/scraper"}}
+        self.assertEqual(self.names(self.check(head, monorepo()), "build"), ["scraper"])
+
+    def test_new_check_dir_runs_only_its_checks(self) -> None:
+        head = monorepo()
+        head["x-ci"]["checks"].append("packages/contracts")
+        result = self.check(head, monorepo())
+        self.assertEqual(self.names(result, "checks"), ["packages/contracts"])
+        self.assertEqual(result["build"], [])
+
+    def test_compose_edit_plus_code_change_unions(self) -> None:
+        head = monorepo()
+        head["services"]["server"]["restart"] = "no"
+        result = self.check(head, monorepo(), ["deploy/compose.yaml", "packages/x.py"])
+        self.assertEqual(self.names(result, "build"), ["processor"])
+
+    def test_incomparable_base_selects_everything(self) -> None:
+        base = {"services": {"kafka": {"image": "apache/kafka:3.8.0"}}}
+        self.assertEqual(self.names(self.check(monorepo(), base), "build"), ["server", "processor"])
+
+    def test_overlay_runtime_and_build_edits(self) -> None:
+        head_overlay = build_overlay()
+        head_overlay["services"]["worker"]["build"]["args"] = {"V": "2"}
+        head_deploy = deploy_file()
+        head_deploy["services"]["api"]["restart"] = "no"
+        result = plan.build_plan(head_deploy, "compose.yaml", "check", SHA,
+                                 ["compose.yaml", "compose.override.yaml"],
+                                 build_overlay=head_overlay, build_compose_file="compose.override.yaml",
+                                 owned_registry="ghcr.io/owner/", base=(deploy_file(), build_overlay()))
+        self.assertEqual(self.names(result, "build"), ["worker"])
+
+    def test_overlay_added_since_base_selects_everything(self) -> None:
+        result = plan.build_plan(deploy_file(), "compose.yaml", "check", SHA, ["compose.override.yaml"],
+                                 build_overlay=build_overlay(), build_compose_file="compose.override.yaml",
+                                 owned_registry="ghcr.io/owner/", base=(deploy_file(), None))
+        self.assertEqual({item["name"] for item in result["build"]}, {"api", "worker"})
 
 
 def deploy_file() -> dict:
@@ -357,13 +484,39 @@ class MainTest(unittest.TestCase):
     def test_writes_single_line_json_outputs(self) -> None:
         changed = self.dir / "changed.txt"
         changed.write_text("apps/server/main.go\n\n", encoding="utf-8")
-        self.assertEqual(self.run_main("--changed-files", str(changed)), 0)
+        self.assertEqual(self.run_main("--changed-files", str(changed), "--base-sha", BASE_SHA), 0)
         out = self.outputs()
         self.assertEqual(out["mode"], "publish")
         self.assertEqual(out["sha-tag"], "sha-a1b2c3d")
-        # Publish ignores the change list and builds every image; there is no carry output.
-        self.assertEqual([item["name"] for item in json.loads(out["build"])], ["server", "processor"])
-        self.assertNotIn("carry", out)
+        build = {item["name"]: item["carry-from"] for item in json.loads(out["build"])}
+        self.assertEqual(build, {"server": "", "processor": "sha-f0e1d2c"})
+
+    def test_base_compose_flags(self) -> None:
+        head = monorepo()
+        head["services"]["server"]["restart"] = "no"
+        self.compose_json.write_text(json.dumps(head), encoding="utf-8")
+        base_json = self.dir / "base.json"
+        base_json.write_text(json.dumps(monorepo()), encoding="utf-8")
+        changed = self.dir / "changed.txt"
+        changed.write_text("deploy/compose.yaml\n", encoding="utf-8")
+        code = self.run_main("--event", "pull_request", "--ref", "refs/pull/7/merge",
+                             "--changed-files", str(changed), "--base-compose-json", str(base_json))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(self.outputs()["build"]), [])
+
+    def test_promotion_flag(self) -> None:
+        code = self.run_main("--event", "pull_request", "--ref", "refs/pull/7/merge", "--promotion")
+        self.assertEqual(code, 0)
+        self.assertEqual((self.outputs()["checks"], self.outputs()["build"]), ("[]", "[]"))
+
+    def test_base_overlay_needs_base_compose(self) -> None:
+        with self.assertRaises(SystemExit):
+            self.run_main("--base-build-compose-json", "x.json")
+
+    def test_base_compose_must_be_a_mapping(self) -> None:
+        base_json = self.dir / "base.json"
+        base_json.write_text("[]", encoding="utf-8")
+        self.assertEqual(self.run_main("--base-compose-json", str(base_json)), 1)
 
     def test_build_overlay_flags(self) -> None:
         self.compose_json.write_text(json.dumps(deploy_file()), encoding="utf-8")

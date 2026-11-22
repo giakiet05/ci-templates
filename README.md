@@ -28,7 +28,7 @@ tags, manual runs), the concurrency group and the permission ceiling; keep those
 | 4 | A **Makefile next to each service's Dockerfile** with `lint` and `test` | Optional: `test-integration` (run after `test`), `ci-setup` (installs extra tools before anything else) |
 | 5 | Optional `x-ci` on a service | `watch`: extra repo-root globs that should rebuild it (shared code outside its folder). `path`: Makefile directory when it is not the Dockerfile's folder |
 | 6 | Optional top-level `x-ci.checks` | Directories that are linted and tested but have no image (shared libraries) |
-| 7 | Branch flow: PRs into `dev`; `dev` into `main` **by PR** (the normal merge button; "Create a merge commit" recommended); releases are `v*` tags on `main` commits whose pipeline finished green | Images are built from `main` only, so every change reaching them went through a reviewed, checked PR |
+| 7 | Branch flow: PRs into `dev`; `dev` into `main` **by PR** (the normal merge button; "Create a merge commit" recommended); releases are `v*` tags on `main` commits whose pipeline finished green | Images are built from `main` only, so every change reaching them went through a reviewed, checked PR. The `dev` -> `main` PR itself is not re-checked (see below); set `promotion-branch` if the branch is not called `dev`, or to `""` to always check |
 
 Paths in `build:` follow Compose rules: relative to the deploy Compose file's directory, in the
 overlay too (Compose resolves every file from the first one). Paths in `x-ci` are relative to the
@@ -69,18 +69,35 @@ does not deploy to Coolify may keep everything in one file.
 | Event | Mode | Jobs (as named in the Actions UI) |
 |---|---|---|
 | PR into `dev` or `main` | check | plan run, lint and test, build image (no push) for changed services |
-| Push to `main` (the PR merge) | publish | build image for **every** service, push `:sha-<short>`, Trivy scan (critical, fixable), move `:main`. No lint and test: the PR into `main` ran them on this code |
-| Manual run on `main` | publish | the same, e.g. to pick up a fixed base image |
+| PR `dev` -> `main` adding nothing beyond `dev` | check | plan run only (green); nothing to lint, test or build |
+| Push to `main` (the PR merge) | publish | build image for each **changed** service and push `:sha-<short>`; retag every other image from the previous `main` commit's `:sha-<short>`; Trivy scan (critical, fixable); move `:main`. No lint and test: the PRs into `dev` ran them on this code |
+| Manual run on `main` | publish | build image for **every** service, e.g. to pick up a fixed base image |
 | Tag `v*` | release | **promote images to release** (`:sha-<short>` to `:vX.Y.Z`), **deploy release**, **create GitHub release** |
 
 Pushes to `dev` run nothing (every change reached `dev` through a checked PR); a push or manual run
 on any branch other than `main` fails with a clear error. Job IDs in `service.yml` stay short
 (`resolve`, `quality`, `build`, `promote`, `deploy`, `release`); they are what `needs:` refers to.
 
-**Changed services** (pull requests only) are those whose folder or `watch` globs match the diff. A
-change to the Compose file, the build overlay or `.github/` counts as a change to everything.
-Publish ignores the diff and builds every image, so each `main` commit has a complete set to
-release; the layer cache keeps unchanged services fast.
+**Changed services** are those whose folder or `watch` globs match the diff against the base commit
+(the PR's base, or the previous `main` commit for a publish). An edit to the Compose file or the
+build overlay selects only the services whose build definition changed: both files are parsed at the
+base and compared service by service on `image` repository, `build:` (context, dockerfile, target,
+args) and `x-ci` (path, watch), plus any new `x-ci.checks` entry. Runtime-only edits (`restart`,
+environment, ports, networks, healthcheck) build nothing. A change under `.github/` counts as a
+change to everything, and so does a Compose file that cannot be parsed at the base.
+
+**Promotion PRs.** A PR from `promotion-branch` (default `dev`, same repository) into `main` runs
+only the plan job when the merge result has exactly the tree of the `dev` tip: every commit on
+`dev` was linted, tested and built in its own PR. If `main` has something `dev` lacks (a hotfix),
+the trees differ and the PR is checked normally.
+
+**Carry on publish.** Every `main` commit still gets a complete `:sha-<short>` set, so any green
+`main` commit can be released. Unchanged images are copied from the previous `main` commit's sha tag
+(`docker buildx imagetools create`), which was built from the same inputs; when that tag is missing
+(its run was cancelled or failed) the image is built instead. A carried image skips the scan only
+when it is already `:main`, i.e. it passed the scan before. A manual run, a first push or a force
+push has no previous commit to compare with and builds everything. See
+[ADR-0003](docs/adr/0003-build-only-changed-images.md).
 
 **Checking a candidate before tagging** (no staging server needed): once the `main` pipeline is
 green, run the exact images a tag would release. `-f compose.yaml` skips the build overlay, so
@@ -124,7 +141,7 @@ actions/plan/                    Compose + diff -> job matrices (Python, stdlib 
 actions/setup-toolchain/         Go / uv / Node from go.mod / pyproject.toml / package.json, then make ci-setup
 actions/deploy-coolify/          set TAG, trigger a Coolify deployment, wait for the result
 templates/pipeline.yml           starter workflow that consuming repos copy
-docs/adr/                        why the pipeline is shaped this way (release model, build overlay)
+docs/adr/                        why the pipeline is shaped this way (release model, build overlay, minimal builds)
 ```
 
 ## Working on this repo
