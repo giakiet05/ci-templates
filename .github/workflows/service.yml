@@ -33,6 +33,12 @@ on:
         required: false
       COOLIFY_APP_UUID:
         required: false
+      # Cloudflare Access service token, when the Coolify API sits behind an Access application
+      # with a Service Auth policy. Leave both unset when the API is reachable directly.
+      CF_ACCESS_CLIENT_ID:
+        required: false
+      CF_ACCESS_CLIENT_SECRET:
+        required: false
 
 jobs:
   resolve:
@@ -224,6 +230,8 @@ jobs:
           api-url: ${{ secrets.COOLIFY_API_URL }}
           token: ${{ secrets.COOLIFY_TOKEN }}
           app-uuid: ${{ secrets.COOLIFY_APP_UUID }}
+          cf-access-client-id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          cf-access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
 
   release:
     name: create GitHub release

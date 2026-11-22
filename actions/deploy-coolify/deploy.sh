@@ -7,6 +7,8 @@
 #   COOLIFY_TOKEN    API token (never printed)
 #   APP_UUID         Coolify application UUID
 #   TIMEOUT_SECONDS  maximum wait for the deployment
+#   CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET
+#                    optional Cloudflare Access service token (never printed); both or neither
 #
 # Exit status: 0 when Coolify reports the deployment finished, 1 on failure, cancel or timeout.
 #
@@ -18,6 +20,8 @@ set -euo pipefail
 : "${COOLIFY_TOKEN:?COOLIFY_TOKEN is required}"
 : "${APP_UUID:?APP_UUID is required}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-900}"
+CF_ACCESS_CLIENT_ID="${CF_ACCESS_CLIENT_ID:-}"
+CF_ACCESS_CLIENT_SECRET="${CF_ACCESS_CLIENT_SECRET:-}"
 POLL_SECONDS=10
 
 api="${COOLIFY_API_URL%/}/api/v1"
@@ -27,10 +31,27 @@ log() {
   printf '%s level=%s app=%s version=%s msg="%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$APP_UUID" "$VERSION" "$2"
 }
 
+# A half-configured service token would be rejected by Access with an HTML login page, which is
+# harder to diagnose than failing here.
+if { [ -n "$CF_ACCESS_CLIENT_ID" ] && [ -z "$CF_ACCESS_CLIENT_SECRET" ]; } ||
+  { [ -z "$CF_ACCESS_CLIENT_ID" ] && [ -n "$CF_ACCESS_CLIENT_SECRET" ]; }; then
+  log error "set both CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, or neither"
+  exit 1
+fi
+
+# Headers go through a curl config on stdin so the secrets never appear in the process list.
+auth_config() {
+  printf 'header = "Authorization: Bearer %s"\n' "$COOLIFY_TOKEN"
+  if [ -n "$CF_ACCESS_CLIENT_ID" ]; then
+    printf 'header = "CF-Access-Client-Id: %s"\n' "$CF_ACCESS_CLIENT_ID"
+    printf 'header = "CF-Access-Client-Secret: %s"\n' "$CF_ACCESS_CLIENT_SECRET"
+  fi
+}
+
 # call ARGS...: authenticated Coolify API request; fails on HTTP errors and prints the body.
 call() {
-  curl --fail-with-body --silent --show-error \
-    --header "Authorization: Bearer ${COOLIFY_TOKEN}" \
+  auth_config | curl --fail-with-body --silent --show-error \
+    --config - \
     --header "Content-Type: application/json" \
     "$@"
 }

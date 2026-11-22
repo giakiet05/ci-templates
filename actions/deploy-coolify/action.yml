@@ -16,6 +16,16 @@ inputs:
   app-uuid:
     description: UUID of the Coolify application.
     required: true
+  cf-access-client-id:
+    description: >-
+      Client ID of a Cloudflare Access service token, for a Coolify API behind Access. Set together
+      with cf-access-client-secret, or leave both empty.
+    required: false
+    default: ""
+  cf-access-client-secret:
+    description: Client secret of that Cloudflare Access service token.
+    required: false
+    default: ""
   timeout-seconds:
     description: How long to wait for the deployment to finish.
     required: false
@@ -31,5 +41,7 @@ runs:
         COOLIFY_API_URL: ${{ inputs.api-url }}
         COOLIFY_TOKEN: ${{ inputs.token }}
         APP_UUID: ${{ inputs.app-uuid }}
+        CF_ACCESS_CLIENT_ID: ${{ inputs.cf-access-client-id }}
+        CF_ACCESS_CLIENT_SECRET: ${{ inputs.cf-access-client-secret }}
         TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
       run: bash "$GITHUB_ACTION_PATH/deploy.sh"

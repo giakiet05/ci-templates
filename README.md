@@ -109,6 +109,7 @@ vulnerabilities:
 |---|---|---|
 | `GITHUB_TOKEN` | always | Provided by GitHub; pushes to GHCR and creates the release |
 | `COOLIFY_API_URL`, `COOLIFY_TOKEN`, `COOLIFY_APP_UUID` | `deploy: coolify` | The Coolify app must use the repo's Compose file and have a `TAG` environment variable |
+| `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET` | optional, `deploy: coolify` | A Cloudflare Access service token, when the Coolify API (`/api/`) is behind an Access application with a Service Auth policy; set both or neither |
 
 The deploy server pulls private GHCR images with a GitHub token that has only `read:packages`,
 configured as a registry credential in Coolify. When Coolify is reachable only on the LAN, run the
