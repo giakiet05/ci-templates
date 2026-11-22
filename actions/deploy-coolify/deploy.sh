@@ -12,7 +12,7 @@
 #
 # Exit status: 0 when Coolify reports the deployment finished, 1 on failure, cancel or timeout.
 #
-# Coolify v4 API endpoints used: PATCH /applications/{uuid}/envs, GET /deploy, GET /deployments/{uuid}.
+# Coolify v4 API endpoints used: PATCH /applications/{uuid}/envs, POST /deploy, GET /deployments/{uuid}.
 set -euo pipefail
 
 : "${VERSION:?VERSION is required}"
@@ -64,7 +64,8 @@ if ! response=$(call --request PATCH "$api/applications/$APP_UUID/envs" --data "
 fi
 
 log info "triggering deployment"
-if ! response=$(call "$api/deploy?uuid=$APP_UUID&force=false"); then
+# Coolify 4.7 answers GET /deploy with 405; POST accepts the same query parameters.
+if ! response=$(call --request POST "$api/deploy?uuid=$APP_UUID&force=false"); then
   log error "deploy request failed: ${response:-no response}"
   exit 1
 fi
