@@ -91,6 +91,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # Read-only GHCR access so test-integration builds can import the registry layer cache.
+      packages: read
     strategy:
       fail-fast: false
       matrix:
@@ -118,6 +120,14 @@ jobs:
         run: make -C "$DIR" lint
       - name: Test
         run: make -C "$DIR" test
+      # Lets a test-integration image build import <image>:buildcache (written on main, see the build
+      # job); a Makefile that does not use it is unaffected.
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
       - name: Integration tests
         run: |
           if make -C "$DIR" -n test-integration >/dev/null 2>&1; then
@@ -152,8 +162,8 @@ jobs:
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Pull requests log in too: they read the private registry layer cache.
       - name: Log in to GHCR
-        if: env.PUBLISH == 'true'
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
@@ -203,8 +213,11 @@ jobs:
           build-args: ${{ matrix.svc.args }}
           push: ${{ env.PUBLISH == 'true' }}
           tags: ${{ matrix.svc.image }}:${{ needs.resolve.outputs.sha-tag }}
-          cache-from: type=gha,scope=${{ matrix.svc.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.svc.name }}
+          # Layer cache in the registry, not the Actions cache: Actions caches are scoped to the branch
+          # that wrote them, so a cache written on main is invisible to PRs into the default branch.
+          # Only publish writes it (exporting a large image's cache costs minutes); PRs only read it.
+          cache-from: type=registry,ref=${{ matrix.svc.image }}:buildcache
+          cache-to: ${{ env.PUBLISH == 'true' && format('type=registry,ref={0}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true', matrix.svc.image) || '' }}
       - name: Scan for critical vulnerabilities
         if: env.PUBLISH == 'true' && steps.carry.outputs.scanned != 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
