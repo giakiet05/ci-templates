@@ -99,6 +99,23 @@ when it is already `:main`, i.e. it passed the scan before. A manual run, a firs
 push has no previous commit to compare with and builds everything. See
 [ADR-0003](docs/adr/0003-build-only-changed-images.md).
 
+**Layer cache.** Each built image keeps its BuildKit layer cache in the registry as
+`<image>:buildcache`. Publish writes it; PRs only read it. It lives in the registry because Actions
+caches are scoped to the branch that wrote them, so a cache written on `main` is invisible to PRs into
+the default branch, and because exporting a large image's cache on every PR costs minutes. The lint
+and test job logs in to GHCR with read access, so a `test-integration` target that builds the same
+image can import the cache too, for example from a CI-only Compose overlay:
+
+```yaml
+services:
+  app-test:
+    build:
+      cache_from:
+        - type=registry,ref=ghcr.io/<owner>/<image>:buildcache
+```
+
+A missing cache (before the first publish, or after a dependency change) only makes the build slower.
+
 **Checking a candidate before tagging** (no staging server needed): once the `main` pipeline is
 green, run the exact images a tag would release. `-f compose.yaml` skips the build overlay, so
 nothing is built locally:
