@@ -27,9 +27,15 @@ inputs:
     required: false
     default: ""
   timeout-seconds:
-    description: How long to wait for the deployment to finish.
+    description: How long to wait for each deployment attempt to finish.
     required: false
-    default: "900"
+    default: "1800"
+  attempts:
+    description: >-
+      How many deployments to trigger when Coolify reports one as failed (usually an image pull
+      cut off midway; layers already pulled are kept, so a retry resumes).
+    required: false
+    default: "3"
 
 runs:
   using: composite
@@ -44,4 +50,5 @@ runs:
         CF_ACCESS_CLIENT_ID: ${{ inputs.cf-access-client-id }}
         CF_ACCESS_CLIENT_SECRET: ${{ inputs.cf-access-client-secret }}
         TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+        DEPLOY_ATTEMPTS: ${{ inputs.attempts }}
       run: bash "$GITHUB_ACTION_PATH/deploy.sh"
